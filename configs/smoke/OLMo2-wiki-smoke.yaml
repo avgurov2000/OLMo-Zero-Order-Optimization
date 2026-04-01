@@ -1,0 +1,147 @@
+# Smoke test: OLMo-2-style tokenizer + только Wikipedia (olmo-mix), несколько шагов обучения
+# и LM-оценка на подмножестве батчей валидации dolma_wiki.
+#
+# Один GPU:
+#   uv run torchrun --nproc_per_node=1 scripts/train.py configs/smoke/OLMo2-wiki-smoke.yaml
+#
+# Два или три GPU на одной машине (подставьте 2 или 3):
+#   uv run torchrun --nproc_per_node=2 scripts/train.py configs/smoke/OLMo2-wiki-smoke.yaml
+#   uv run torchrun --nproc_per_node=3 scripts/train.py configs/smoke/OLMo2-wiki-smoke.yaml
+#
+# global_train_batch_size кратен 1, 2 и 3 — при смене числа GPU пересчитывайте батч сами:
+#   device_train_batch_size = global_train_batch_size // nproc_per_node (должно быть ≥ 1).
+#
+# Если torchrun ругается на localhost / IPv6:
+#   export MASTER_ADDR=127.0.0.1
+
+run_name: olmo2-wiki-smoke
+seed: 42
+save_overwrite: true
+no_pre_train_checkpoint: true
+save_data_indices: false
+
+save_folder: ./.olmo-smoke-runs/wiki-smoke
+save_interval: null
+save_interval_unsharded: null
+save_num_checkpoints_to_keep: 0
+save_num_unsharded_checkpoints_to_keep: 0
+
+# Явная остановка: иначе по умолчанию stop_at = max_duration + 10 шагов.
+max_duration: 100
+stop_at: 3
+
+distributed_strategy: fsdp
+
+fsdp:
+  wrapping_strategy: null
+  sharding_strategy: SHARD_GRAD_OP
+  precision: pure
+
+precision: fp32
+
+model:
+  d_model: 512
+  n_heads: 8
+  n_layers: 2
+  mlp_ratio: 8
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_theta: 500000
+  flash_attention: false
+  attention_dropout: 0.0
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1.0e-6
+  bias_for_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  norm_after: true
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 1024
+  vocab_size: 100278
+  embedding_size: 100352
+  eos_token_id: 100257
+  pad_token_id: 100277
+  init_device: meta
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+
+fused_loss: false
+softmax_auxiliary_loss: false
+
+compile: null
+
+optimizer:
+  name: adamw
+  learning_rate: 1.0e-4
+  weight_decay: 0.1
+  eps: 1.0e-8
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  betas:
+    - 0.9
+    - 0.95
+
+scheduler:
+  name: cosine_with_warmup
+  units: steps
+  t_warmup: 1
+  t_max: 100
+  alpha_f: 0.1
+  warmup_min_lr: 0.0
+
+tokenizer:
+  identifier: tokenizers/allenai_dolma2.json
+  truncate_direction: right
+
+eval_interval: 1000
+eval_subset_num_batches: -1
+device_eval_batch_size: 1
+
+evaluators:
+  - label: dolma_wiki-validation
+    type: lm
+    subset_num_batches: 2
+    device_eval_batch_size: 1
+    data:
+      pad_direction: right
+      num_workers: 0
+      drop_last: true
+      pin_memory: false
+      prefetch_factor: null
+      persistent_workers: false
+      memmap_dtype: uint32
+      paths:
+        - http://olmo-data.org/eval-data/perplexity/v3_small_dolma2-tokenizer/dolma_wiki/val/part-0-00000.npy
+
+data:
+  pad_direction: right
+  num_workers: 0
+  drop_last: true
+  pin_memory: false
+  prefetch_factor: null
+  persistent_workers: false
+  memmap_dtype: uint32
+  instance_filter: null
+  paths:
+    - http://olmo-data.org/preprocessed/olmo-mix/danyh-compiled-v1_7/documents/wiki/allenai/dolma2-tokenizer/part-0-00000.npy
+    - http://olmo-data.org/preprocessed/olmo-mix/danyh-compiled-v1_7/documents/wiki/allenai/dolma2-tokenizer/part-1-00000.npy
+
+global_train_batch_size: 6
+device_train_microbatch_size: 6
+
+max_grad_norm: 1.0
+
+speed_monitor:
+  window_size: 1
+
+gen1_gc_interval: null
+
+console_log_interval: 1
+canceled_check_interval: 1000
