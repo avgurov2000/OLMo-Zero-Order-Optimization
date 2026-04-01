@@ -52,6 +52,7 @@ site/
 
 # runs
 /runs/
+.olmo-smoke-runs/
 /wandb/
 /scratch/
 core

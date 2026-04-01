@@ -62,6 +62,10 @@ figures = [
 Homepage = "https://github.com/allenai/OLMo"
 Repository = "https://github.com/allenai/OLMo"
 
+[tool.uv]
+# Единая среда: базовые зависимости + dev + train (см. optional-dependencies all).
+package = true
+
 [tool.setuptools]
 include-package-data = true
 
