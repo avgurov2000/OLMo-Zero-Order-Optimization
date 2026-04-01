@@ -4,6 +4,9 @@ dataset files, such as those from c4. Each file is expected to be a gzipped JSON
 file, which each JSON line has a field named "text" that is a string representing a single
 document from the dataset.
 
+Defaults match OLMo-2 configs (``tokenizers/allenai_dolma2.json``, ``uint32``). Override
+``--tokenizer`` / ``--dtype`` if your training YAML uses something else (e.g. tiny models).
+
 To test out this script, run:
 
 ```bash
@@ -47,8 +50,19 @@ from smashed.utils.io_utils import (
 
 from olmo import Tokenizer
 from olmo.util import prepare_cli_environment
+from olmo_data import get_data_path, is_data_file
 
 log = logging.getLogger(__name__)
+
+
+def load_tokenizer_for_memmap(tokenizer_id: str) -> Tokenizer:
+    """Same resolution as training: local file, then ``olmo_data`` bundle, then Hugging Face Hub."""
+    if Path(tokenizer_id).is_file():
+        return Tokenizer.from_file(tokenizer_id, truncate_to=None)
+    if is_data_file(tokenizer_id):
+        with get_data_path(tokenizer_id) as tokenizer_path:
+            return Tokenizer.from_file(tokenizer_path, truncate_to=None)
+    return Tokenizer.from_pretrained(tokenizer_id, truncate_to=None)
 
 T = TypeVar("T", bound=Sequence)
 
@@ -110,7 +124,7 @@ def tokenize_file(
 class MemmapFile:
     """Context manager responsible for writing, resizing, and closing / uploading a memmap file."""
 
-    DEFAULT_MAX_TOKENS = 512 * 1024 * 1024  # 500M tokens / 1GB
+    DEFAULT_MAX_TOKENS = 512 * 1024 * 1024  # max tokens per shard (memmap size scales with dtype)
 
     def __init__(
         self,
@@ -229,7 +243,7 @@ def fill_memmap(
     memmap_path: str,
     dtype: np.dtype,
     safe_mode: bool = False,
-    max_tokens: int = 512 * 1024 * 1024,  # 512M tokens * 2 bytes per token (uint16) = 1GB
+    max_tokens: int = 512 * 1024 * 1024,  # max tokens per memmap shard (size on disk scales with --dtype)
     sample_rate: float = 1.0,
     random_seed: int = 3920,
     repeat_sequence: int = 1,
@@ -241,7 +255,7 @@ def fill_memmap(
     np.random.seed(random_seed)
 
     # we need to make a new tokenizer here because it's not pickleable
-    tokenizer = Tokenizer.from_pretrained(tokenizer_id, truncate_to=None)
+    tokenizer = load_tokenizer_for_memmap(tokenizer_id)
 
     # first memmap file will be created in the loop below
     memmap: Optional[MemmapFile] = None
@@ -348,10 +362,10 @@ def make_source_and_target(
     "--tokenizer",
     "tokenizer_id",
     type=str,
-    help="Name of path of a pretrained tokenizer",
-    default="allenai/eleuther-ai-gpt-neox-20b-pii-special",
+    help="Hugging Face id or path to tokenizer JSON (same as training config ``tokenizer.identifier``)",
+    default="tokenizers/allenai_dolma2.json",
 )
-@click.option("--dtype", "dtype_str", default="uint16")
+@click.option("--dtype", "dtype_str", default="uint32")
 @click.option("--validate/--no-validate", default=False)
 @click.option("--sample-rate", type=click.FloatRange(min=0.0, max=1.0), default=1.0)
 @click.option("--random-seed", type=int, default=3920)
@@ -367,7 +381,7 @@ def make_source_and_target(
     "--max-tokens",
     default=512 * 1024 * 1024,
     type=int,
-    help="Maximum number of tokens to store in a single memmap file (default: 512M tokens or 1GB)",
+    help="Maximum number of tokens per memmap shard (default: 512M; file size depends on --dtype)",
 )
 @click.option("--debug/--no-debug", default=False, help="Enable debug (single process mode)")
 @click.option(
@@ -378,8 +392,8 @@ def make_source_and_target(
 def main(
     src: Tuple[str, ...],
     output: str,
-    tokenizer_id: str = "EleutherAI/gpt-neox-20b",
-    dtype_str: str = "uint16",
+    tokenizer_id: str = "tokenizers/allenai_dolma2.json",
+    dtype_str: str = "uint32",
     validate: bool = False,
     max_tokens: int = 512 * 1024 * 1024,
     safe_mode: bool = False,
@@ -467,7 +481,7 @@ def main(
 
     if validate:
         log.info("Validating...")
-        tokenizer = Tokenizer.from_pretrained(tokenizer_id, truncate_to=None)
+        tokenizer = load_tokenizer_for_memmap(tokenizer_id)
 
         def encode_fn(row):
             return tokenizer.encode(json.loads(row)["text"], add_special_tokens=True)  # noqa
