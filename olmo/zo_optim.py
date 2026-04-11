@@ -71,6 +71,23 @@ class MeZO(ZeroOrderOptimizer):
             self._generators[device] = torch.Generator(device=device)
         return self._generators[device]
 
+    def _reset_generators(self, z_seed: int) -> None:
+        """Seed each device's generator once before iterating parameters.
+
+        Calling manual_seed inside the parameter loop would reset the RNG state
+        for every parameter, causing all parameters of the same shape to receive
+        the identical perturbation vector.  Seeding once here lets the generator
+        advance sequentially through all parameters so each gets an independent z.
+        Both _perturb and _apply_update call this before their loops, so they
+        reproduce the same per-parameter z from the same seed.
+        """
+        seen: set[torch.device] = set()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.requires_grad and p.device not in seen:
+                    self._get_generator(p.device).manual_seed(z_seed)
+                    seen.add(p.device)
+
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor], z_seed: Optional[int] = None) -> torch.Tensor:
         if z_seed is None:
@@ -93,17 +110,18 @@ class MeZO(ZeroOrderOptimizer):
         return loss_plus
 
     def _perturb(self, z_seed: int, scaling_factor: float) -> None:
+        self._reset_generators(z_seed)
         for group in self.param_groups:
             eps = group["zo_eps"]
             for p in group["params"]:
                 if not p.requires_grad:
                     continue
                 gen = self._get_generator(p.device)
-                gen.manual_seed(z_seed)
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
                 p.data.add_(z, alpha=scaling_factor * eps)
 
     def _apply_update(self, z_seed: int, projected_grad: float) -> None:
+        self._reset_generators(z_seed)
         for group in self.param_groups:
             lr = group["lr"]
             eps = group["zo_eps"]
@@ -113,7 +131,6 @@ class MeZO(ZeroOrderOptimizer):
                 if not p.requires_grad:
                     continue
                 gen = self._get_generator(p.device)
-                gen.manual_seed(z_seed)
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
                 grad_est = z.mul_(projected_grad / eps)
                 if weight_decay != 0.0:
@@ -173,6 +190,18 @@ class ZoAdam(ZeroOrderOptimizer):
             self._generators[device] = torch.Generator(device=device)
         return self._generators[device]
 
+    def _reset_generators(self, z_seed: int) -> None:
+        """Seed each device's generator once before iterating parameters.
+
+        See MeZO._reset_generators for rationale.
+        """
+        seen: set[torch.device] = set()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.requires_grad and p.device not in seen:
+                    self._get_generator(p.device).manual_seed(z_seed)
+                    seen.add(p.device)
+
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor], z_seed: Optional[int] = None) -> torch.Tensor:
         if z_seed is None:
@@ -195,17 +224,18 @@ class ZoAdam(ZeroOrderOptimizer):
         return loss_plus
 
     def _perturb(self, z_seed: int, scaling_factor: float) -> None:
+        self._reset_generators(z_seed)
         for group in self.param_groups:
             zo_eps = group["zo_eps"]
             for p in group["params"]:
                 if not p.requires_grad:
                     continue
                 gen = self._get_generator(p.device)
-                gen.manual_seed(z_seed)
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
                 p.data.add_(z, alpha=scaling_factor * zo_eps)
 
     def _apply_update(self, z_seed: int, projected_grad: float) -> None:
+        self._reset_generators(z_seed)
         for group in self.param_groups:
             lr = group["lr"]
             zo_eps = group["zo_eps"]
@@ -221,7 +251,6 @@ class ZoAdam(ZeroOrderOptimizer):
                     p.data.mul_(1.0 - lr * weight_decay)
 
                 gen = self._get_generator(p.device)
-                gen.manual_seed(z_seed)
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
                 g = z.mul(projected_grad / zo_eps)
 
@@ -325,7 +354,7 @@ class LOZO(ZeroOrderOptimizer):
             if not p.requires_grad:
                 continue
             eps = group["zo_eps"]
-            if p.dim() >= 2:
+            if p.dim() == 2:
                 rank = group["rank"]
                 state = self.state[p]
                 if refresh_v or "v" not in state:
@@ -346,14 +375,14 @@ class LOZO(ZeroOrderOptimizer):
                 continue
             lr = group["lr"]
             weight_decay = group["weight_decay"]
-            if p.dim() >= 2:
+            if p.dim() == 2:
                 v = self.state[p]["v"]
                 u = self._get_u(p, z_seed, idx)
                 p.data.addmm_(u, v.t(), alpha=-lr * projected_grad)
                 if weight_decay != 0.0:
-                    p.data.add_(p.data, alpha=-lr * weight_decay)
+                    p.data.mul_(1.0 - lr * weight_decay)
             else:
                 z = self._get_z1d(p, z_seed, idx)
                 p.data.add_(z, alpha=-lr * projected_grad)
                 if weight_decay != 0.0:
-                    p.data.add_(p.data, alpha=-lr * weight_decay)
+                    p.data.mul_(1.0 - lr * weight_decay)
