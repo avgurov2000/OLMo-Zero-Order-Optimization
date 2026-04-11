@@ -65,6 +65,7 @@ class MeZO(ZeroOrderOptimizer):
         super().__init__(params, defaults)
         self.vector_sampler = VectorSampler(vector_sampling_type)
         self._generators: dict[torch.device, torch.Generator] = {}
+        self._last_metrics: dict[str, float] = {}
 
     def _get_generator(self, device: torch.device) -> torch.Generator:
         if device not in self._generators:
@@ -88,6 +89,23 @@ class MeZO(ZeroOrderOptimizer):
                     self._get_generator(p.device).manual_seed(z_seed)
                     seen.add(p.device)
 
+    def get_post_step_metrics(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+        """Return ZO diagnostics collected during the last step.
+
+        Metrics
+        -------
+        projected_grad_abs
+            Absolute value of the SPSA scalar estimate ``(f⁺ − f⁻) / (2ε)``
+            (or ``(f⁺ − f⁻) / ε`` for one_side mode).  Indicates the
+            magnitude of the loss difference along the perturbation direction.
+        grad_est_norm
+            Global L2 norm of the gradient estimate vector
+            ``z * projected_grad / ε`` concatenated across all parameters
+            (before lr scaling and weight decay).  Comparable to a gradient
+            norm in first-order training.
+        """
+        return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
+
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor], z_seed: Optional[int] = None) -> torch.Tensor:
         if z_seed is None:
@@ -107,6 +125,7 @@ class MeZO(ZeroOrderOptimizer):
             projected_grad = (loss_plus - loss_minus).item()
 
         self._apply_update(z_seed, projected_grad)
+        self._last_metrics["projected_grad_abs"] = abs(projected_grad)
         return loss_plus
 
     def _perturb(self, z_seed: int, scaling_factor: float) -> None:
@@ -122,6 +141,7 @@ class MeZO(ZeroOrderOptimizer):
 
     def _apply_update(self, z_seed: int, projected_grad: float) -> None:
         self._reset_generators(z_seed)
+        grad_sum_sq = 0.0
         for group in self.param_groups:
             lr = group["lr"]
             eps = group["zo_eps"]
@@ -133,6 +153,8 @@ class MeZO(ZeroOrderOptimizer):
                 gen = self._get_generator(p.device)
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
                 grad_est = z.mul_(projected_grad / eps)
+                # Accumulate before weight decay to track pure SPSA estimate norm.
+                grad_sum_sq += grad_est.to(torch.float32).norm().item() ** 2
                 if weight_decay != 0.0:
                     grad_est.add_(p.data, alpha=weight_decay)
                 if momentum != 0.0:
@@ -144,6 +166,7 @@ class MeZO(ZeroOrderOptimizer):
                         buf.mul_(momentum).add_(grad_est)
                         grad_est = buf
                 p.data.add_(grad_est, alpha=-lr)
+        self._last_metrics["grad_est_norm"] = math.sqrt(grad_sum_sq)
 
 
 class ZoAdam(ZeroOrderOptimizer):
@@ -184,6 +207,7 @@ class ZoAdam(ZeroOrderOptimizer):
         super().__init__(params, defaults)
         self.vector_sampler = VectorSampler(vector_sampling_type)
         self._generators: dict[torch.device, torch.Generator] = {}
+        self._last_metrics: dict[str, float] = {}
 
     def _get_generator(self, device: torch.device) -> torch.Generator:
         if device not in self._generators:
@@ -201,6 +225,22 @@ class ZoAdam(ZeroOrderOptimizer):
                 if p.requires_grad and p.device not in seen:
                     self._get_generator(p.device).manual_seed(z_seed)
                     seen.add(p.device)
+
+    def get_post_step_metrics(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+        """Return ZO diagnostics collected during the last step.
+
+        Metrics
+        -------
+        projected_grad_abs
+            Absolute value of the SPSA scalar ``(f⁺ − f⁻) / (2ε)``.
+        grad_est_norm
+            Global L2 norm of ``z * projected_grad / ε`` across all parameters
+            (raw SPSA estimate, before Adam preconditioning and lr scaling).
+        update_norm
+            Global L2 norm of the actual Adam-preconditioned update applied
+            to the parameters.  Reflects the effect of moment scaling.
+        """
+        return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
 
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor], z_seed: Optional[int] = None) -> torch.Tensor:
@@ -221,6 +261,7 @@ class ZoAdam(ZeroOrderOptimizer):
             projected_grad = (loss_plus - loss_minus).item()
 
         self._apply_update(z_seed, projected_grad)
+        self._last_metrics["projected_grad_abs"] = abs(projected_grad)
         return loss_plus
 
     def _perturb(self, z_seed: int, scaling_factor: float) -> None:
@@ -236,6 +277,8 @@ class ZoAdam(ZeroOrderOptimizer):
 
     def _apply_update(self, z_seed: int, projected_grad: float) -> None:
         self._reset_generators(z_seed)
+        grad_sum_sq = 0.0
+        update_sum_sq = 0.0
         for group in self.param_groups:
             lr = group["lr"]
             zo_eps = group["zo_eps"]
@@ -255,6 +298,9 @@ class ZoAdam(ZeroOrderOptimizer):
                 g = z.mul(projected_grad / zo_eps)
 
                 g32 = g.to(dtype=torch.float32)
+                # Track raw SPSA estimate norm before moment updates.
+                grad_sum_sq += g32.norm().item() ** 2
+
                 state = self.state[p]
                 if len(state) == 0:
                     state["step"] = torch.zeros((), dtype=torch.float32, device=torch.device("cpu"))
@@ -274,7 +320,11 @@ class ZoAdam(ZeroOrderOptimizer):
                 step_size_neg = -lr / bias_c1
                 denom = exp_avg_sq.sqrt().div(math.sqrt(bias_c2)).add(adam_eps)
                 update = (exp_avg * step_size_neg / denom).to(dtype=p.dtype)
+                update_sum_sq += update.to(torch.float32).norm().item() ** 2
                 p.data.add_(update)
+
+        self._last_metrics["grad_est_norm"] = math.sqrt(grad_sum_sq)
+        self._last_metrics["update_norm"] = math.sqrt(update_sum_sq)
 
 
 class LOZO(ZeroOrderOptimizer):
@@ -307,6 +357,22 @@ class LOZO(ZeroOrderOptimizer):
         )
         super().__init__(params, defaults)
         self._step_count = 0
+        self._last_metrics: dict[str, float] = {}
+
+    def get_post_step_metrics(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+        """Return ZO diagnostics collected during the last step.
+
+        Metrics
+        -------
+        projected_grad_abs
+            Absolute value of the SPSA scalar ``(f⁺ − f⁻) / (2ε)``.
+        grad_est_norm
+            Global L2 norm of the low-rank gradient estimate ``projected_grad * Z``
+            across all parameters (before lr scaling).  For 2D params the
+            Frobenius norm of ``U @ V.T`` is computed efficiently via the
+            ``rank × rank`` Gram matrices; for 1D params the standard L2 norm.
+        """
+        return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
 
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor], z_seed: Optional[int] = None) -> torch.Tensor:
@@ -328,6 +394,7 @@ class LOZO(ZeroOrderOptimizer):
             projected_grad = (loss_plus - loss_minus).item() / self.defaults["zo_eps"]
 
         self._apply_update(z_seed, projected_grad)
+        self._last_metrics["projected_grad_abs"] = abs(projected_grad)
         self._step_count += 1
         return loss_plus
 
@@ -370,6 +437,7 @@ class LOZO(ZeroOrderOptimizer):
                 p.data.add_(z, alpha=scaling_factor * eps)
 
     def _apply_update(self, z_seed: int, projected_grad: float) -> None:
+        grad_sum_sq = 0.0
         for group, p, idx in self._flat_params():
             if not p.requires_grad:
                 continue
@@ -378,11 +446,18 @@ class LOZO(ZeroOrderOptimizer):
             if p.dim() == 2:
                 v = self.state[p]["v"]
                 u = self._get_u(p, z_seed, idx)
+                # ||projected_grad * U @ V.T||_F^2 = projected_grad^2 * tr(U.T@U @ V.T@V)
+                # Computed via two (rank x rank) Gram matrices — no full m×n materialisation.
+                ugu = u.to(torch.float32).T @ u.to(torch.float32)  # (rank, rank)
+                vgv = v.to(torch.float32).T @ v.to(torch.float32)  # (rank, rank)
+                grad_sum_sq += projected_grad ** 2 * (ugu @ vgv).trace().item()
                 p.data.addmm_(u, v.t(), alpha=-lr * projected_grad)
                 if weight_decay != 0.0:
                     p.data.mul_(1.0 - lr * weight_decay)
             else:
                 z = self._get_z1d(p, z_seed, idx)
+                grad_sum_sq += (projected_grad * z.to(torch.float32)).norm().item() ** 2
                 p.data.add_(z, alpha=-lr * projected_grad)
                 if weight_decay != 0.0:
                     p.data.mul_(1.0 - lr * weight_decay)
+        self._last_metrics["grad_est_norm"] = math.sqrt(max(grad_sum_sq, 0.0))
