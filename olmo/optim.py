@@ -12,7 +12,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.optim.optimizer import Optimizer as OptimizerBase
 
 from . import LayerNormBase
-from .config import OptimizerType, SchedulerConfig, SchedulerType, TrainConfig
+from .config import DistributedStrategy, OptimizerType, SchedulerConfig, SchedulerType, TrainConfig
+from .exceptions import OLMoConfigurationError
 from .torch_util import get_default_device, is_distributed
 
 __all__ = [
@@ -939,7 +940,27 @@ def fix_optim_state_dict(optimizer: Optimizer, state_dict: Dict[str, Any]) -> Di
     return state_dict
 
 
-def build_optimizer(cfg: TrainConfig, model: nn.Module) -> Optimizer:
+def _zo_param_groups(cfg: TrainConfig, model: nn.Module) -> List[Dict[str, Any]]:
+    param_groups = get_param_groups(cfg, model)
+    for g in param_groups:
+        g["zo_eps"] = cfg.optimizer.zo_eps
+        g["perturbation_mode"] = cfg.optimizer.zo_perturbation_mode
+    return param_groups
+
+
+def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer:
+    if cfg.optimizer.name in (OptimizerType.mezo, OptimizerType.lozo, OptimizerType.zo_adam):
+        if cfg.distributed_strategy == DistributedStrategy.fsdp:
+            raise OLMoConfigurationError(
+                "MeZO, LOZO, and ZoAdam require full weights on each process; they are not supported with FSDP. "
+                "Use distributed_strategy: single or ddp."
+            )
+        if cfg.optimizer.zo_perturbation_mode not in ("two_side", "one_side"):
+            raise OLMoConfigurationError(
+                f"optimizer.zo_perturbation_mode must be 'two_side' or 'one_side', "
+                f"got {cfg.optimizer.zo_perturbation_mode!r}"
+            )
+
     param_groups = get_param_groups(cfg, model)
     log.info(f"Constructing optimizer with {len(param_groups)} param groups")
     if cfg.optimizer.name == OptimizerType.lionw:
@@ -960,6 +981,51 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> Optimizer:
             record_update_metrics=cfg.optimizer.record_update_metrics,
             selective_updates=cfg.optimizer.selective_updates,
             eps=cfg.optimizer.eps,
+        )
+    elif cfg.optimizer.name == OptimizerType.mezo:
+        from .zo_optim import MeZO
+
+        zg = _zo_param_groups(cfg, model)
+        for g in zg:
+            g["momentum"] = cfg.optimizer.mezo_momentum
+        return MeZO(
+            zg,
+            lr=cfg.optimizer.learning_rate,
+            zo_eps=cfg.optimizer.zo_eps,
+            perturbation_mode=cfg.optimizer.zo_perturbation_mode,
+            weight_decay=cfg.optimizer.weight_decay,
+            momentum=cfg.optimizer.mezo_momentum,
+            vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
+        )
+    elif cfg.optimizer.name == OptimizerType.lozo:
+        from .zo_optim import LOZO
+
+        zg = _zo_param_groups(cfg, model)
+        for g in zg:
+            g["rank"] = cfg.optimizer.lozo_rank
+            g["step_interval"] = cfg.optimizer.lozo_step_interval
+        return LOZO(
+            zg,
+            lr=cfg.optimizer.learning_rate,
+            zo_eps=cfg.optimizer.zo_eps,
+            rank=cfg.optimizer.lozo_rank,
+            step_interval=cfg.optimizer.lozo_step_interval,
+            perturbation_mode=cfg.optimizer.zo_perturbation_mode,
+            weight_decay=cfg.optimizer.weight_decay,
+        )
+    elif cfg.optimizer.name == OptimizerType.zo_adam:
+        from .zo_optim import ZoAdam
+
+        zg = _zo_param_groups(cfg, model)
+        return ZoAdam(
+            zg,
+            lr=cfg.optimizer.learning_rate,
+            zo_eps=cfg.optimizer.zo_eps,
+            betas=cfg.optimizer.betas,
+            eps=cfg.optimizer.eps,
+            perturbation_mode=cfg.optimizer.zo_perturbation_mode,
+            weight_decay=cfg.optimizer.weight_decay,
+            vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
         )
     else:
         raise NotImplementedError

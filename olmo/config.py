@@ -499,6 +499,9 @@ class ModelConfig(BaseConfig):
 class OptimizerType(StrEnum):
     lionw = "lionw"
     adamw = "adamw"
+    mezo = "mezo"
+    lozo = "lozo"
+    zo_adam = "zo_adam"
 
 
 @dataclass
@@ -533,6 +536,24 @@ class OptimizerConfig(BaseConfig):
     Whether to record detailed metrics about the optimizer's parameter updates, like the norm and max
     of the update with AdamW.
     """
+
+    zo_eps: float = 1e-3
+    """Finite-difference step ε for MeZO / LOZO / ZoAdam (perturbation scale)."""
+
+    zo_perturbation_mode: str = "two_side"
+    """``two_side`` (±ε) or ``one_side`` (+ε vs baseline); both use two forward passes per step."""
+
+    lozo_rank: int = 4
+    """Low-rank factor r for LOZO perturbations on 2D parameters (matmul weights)."""
+
+    lozo_step_interval: int = 1
+    """How often LOZO refreshes V; 1 = every step."""
+
+    mezo_momentum: float = 0.0
+    """MeZO-only: momentum on the estimated gradient direction."""
+
+    mezo_vector_sampling_type: str = "standard_normal"
+    """MeZO / ZoAdam: ``standard_normal`` or ``lp_sphere`` for the probing direction ``z``."""
 
     def __post_init__(self):
         self.betas = tuple(self.betas)  # type: ignore[assignment]

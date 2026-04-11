@@ -44,7 +44,9 @@ from .data import IterableDataset
 from .eval import Evaluator
 from .exceptions import OLMoConfigurationError
 from .model import OLMo
-from .optim import Optimizer, Scheduler
+from torch.optim import Optimizer as TorchOptimizer
+
+from .optim import Scheduler
 from .torch_util import (
     SingleAccelerator,
     barrier,
@@ -52,11 +54,13 @@ from .torch_util import (
     get_fs_local_rank,
     get_global_rank,
     get_world_size,
+    is_distributed,
     move_to_device,
     peak_gpu_memory,
     synchronize_flag,
     synchronize_value,
 )
+from .zo_optim import ZeroOrderOptimizer
 from .util import upload
 
 __all__ = ["SpeedMonitor", "LRMonitor", "Trainer"]
@@ -210,7 +214,7 @@ class Trainer:
     cfg: TrainConfig
     model: OLMo
     dist_model: Union[DDP, FSDP, SingleAccelerator]
-    optim: Optimizer
+    optim: TorchOptimizer
     scheduler: Scheduler
     train_loader: DataLoader
     device: torch.device
@@ -829,7 +833,85 @@ class Trainer:
 
         return ce_batch_loss, z_batch_loss
 
+    def _train_step_zero_order(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
+        """
+        MeZO / LOZO: no backward; optimizer step runs 2–3 forward passes via ``closure``.
+        Loss inside ``closure`` is averaged over distributed ranks so all replicas apply the same update.
+        """
+        metrics: Dict[str, float] = {}
+
+        if self.indices_file is not None and "index" in batch:
+            indices = "\t".join(str(int(i)) for i in batch["index"])
+            self.indices_file.write(f"{self.global_step}\t{indices}\n")
+
+        if (instance_mask := batch.get("instance_mask")) is not None:
+            metrics["train/masked_instances_local_rank"] = (~instance_mask).sum().item()
+
+        self.optim.zero_grad(set_to_none=True)
+        batch = move_to_device(batch, self.device)
+        batch_size_in_tokens = batch["input_ids"].numel()
+        micro_batches = self.split_batch(batch)
+
+        z_seed: Optional[int] = None
+        if is_distributed():
+            z_seed_local = int(np.random.randint(0, 1_000_000_000)) if get_global_rank() == 0 else 0
+            z_seed = int(synchronize_value(z_seed_local, self.device))
+
+        def closure() -> torch.Tensor:
+            total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+            autocast_device = "mps" if self.device.type == "mps" else "cuda"
+            with torch.inference_mode():
+                with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
+                    for micro_batch in micro_batches:
+                        loss, _, _ = self.train_micro_batch(micro_batch, batch_size_in_tokens)
+                        total_loss = total_loss + loss.float()
+            if is_distributed():
+                dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+                total_loss = total_loss / get_world_size()
+            return total_loss
+
+        for group in self.optim.param_groups:
+            group["lr"] = self.scheduler.get_lr(
+                self.cfg.optimizer.learning_rate, self.scheduler_current, self.scheduler_max
+            )
+            if "max_grad_norm" in group:
+                group["max_grad_norm"] = self.scheduler.get_max_grad_norm(
+                    self.cfg.max_grad_norm, self.scheduler_current, self.scheduler_max
+                )
+            if "max_grad_norm_ratio" in group:
+                group["max_grad_norm_ratio"] = self.scheduler.get_max_grad_norm(
+                    self.cfg.max_grad_norm_ratio, self.scheduler_current, self.scheduler_max
+                )
+
+        loss = self.optim.step(closure, z_seed=z_seed)  # type: ignore[call-arg]
+
+        ce_batch_loss = loss.detach()
+        if reduce_global_loss:
+            dist.reduce(ce_batch_loss, 0)
+            ce_batch_loss.div_(get_world_size())
+
+        if torch.isnan(ce_batch_loss):
+            raise ValueError("nan loss encountered")
+
+        should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
+        if should_log_optim_metrics_this_step and hasattr(self.optim, "get_post_step_metrics"):
+            optim_metrics = self.optim.get_post_step_metrics(
+                self.dist_model, process_group=self.dist_model.process_group
+            )
+            for key, value in optim_metrics.items():
+                metrics[f"optim/{key}"] = value.item()
+
+        self.cur_train_loss = ce_batch_loss.item()
+        self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)
+        metrics["train/CrossEntropyLoss"] = self.cur_train_loss
+        metrics["train/Perplexity"] = math.exp(self.cur_train_loss)
+
+        return metrics
+
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
+        if isinstance(self.optim, ZeroOrderOptimizer):
+            return self._train_step_zero_order(batch, reduce_global_loss=reduce_global_loss)
+
         metrics: Dict[str, float] = {}
 
         # Write data-indices to file.
