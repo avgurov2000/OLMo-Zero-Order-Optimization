@@ -1,0 +1,144 @@
+# Smoke-тест для LDSDMuon (ZO-MUON из ZO-LDSD) + DDP на маленькой модели.
+# Проверяет: инициализация оптимизатора, 5 шагов, синхронизация z_seed между рангами,
+# get_post_step_metrics, логирование.
+#
+# Один процесс (sanity check):
+#   uv run torchrun --nproc_per_node=1 scripts/train.py configs/smoke/OLMo2-ddp-ldsd-muon-smoke.yaml
+#
+# Два GPU (основной сценарий):
+#   uv run torchrun --nproc_per_node=2 scripts/train.py configs/smoke/OLMo2-ddp-ldsd-muon-smoke.yaml
+#
+# global_train_batch_size=8 делится на 1, 2, 4, 8 — подходит для любого из этих вариантов.
+#
+# IPv6 / localhost:
+#   export MASTER_ADDR=127.0.0.1
+
+run_name: olmo2-ddp-ldsd-muon-smoke
+seed: 42
+save_overwrite: true
+no_pre_train_checkpoint: true
+save_data_indices: false
+
+save_folder: ./.olmo-smoke-runs/ddp-ldsd-muon-smoke
+save_interval: null
+save_interval_unsharded: null
+save_num_checkpoints_to_keep: 0
+save_num_unsharded_checkpoints_to_keep: 0
+
+max_duration: 100
+stop_at: 5
+
+distributed_strategy: ddp
+
+ddp:
+  grad_sync_mode: batch
+  find_unused_params: false
+
+precision: fp32
+
+model:
+  d_model: 384
+  n_heads: 8
+  n_layers: 2
+  mlp_ratio: 4
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_theta: 500000
+  flash_attention: false
+  attention_dropout: 0.0
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1.0e-6
+  bias_for_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  norm_after: true
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 512
+  vocab_size: 100278
+  embedding_size: 100352
+  eos_token_id: 100257
+  pad_token_id: 100277
+  init_device: cuda
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+
+fused_loss: false
+softmax_auxiliary_loss: false
+
+compile: null
+
+optimizer:
+  name: ldsd_muon
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  metrics_log_interval: 1
+  zo_eps: 1.0e-3
+  zo_perturbation_mode: two_side
+  mezo_vector_sampling_type: standard_normal
+  ldsd_muon_newtonschulz_steps: 5
+
+scheduler:
+  name: cosine_with_warmup
+  units: steps
+  t_warmup: 2
+  t_max: 100
+  alpha_f: 0.1
+  warmup_min_lr: 0.0
+
+tokenizer:
+  identifier: tokenizers/allenai_dolma2.json
+  truncate_direction: right
+
+global_train_batch_size: 8
+device_train_microbatch_size: 2
+
+eval_interval: 1000
+eval_subset_num_batches: -1
+device_eval_batch_size: 1
+
+evaluators:
+  - label: dolma_wiki-validation
+    type: lm
+    subset_num_batches: 1
+    device_eval_batch_size: 1
+    data:
+      pad_direction: right
+      num_workers: 0
+      drop_last: true
+      pin_memory: false
+      prefetch_factor: null
+      persistent_workers: false
+      memmap_dtype: uint32
+      paths:
+        - http://olmo-data.org/eval-data/perplexity/v3_small_dolma2-tokenizer/dolma_wiki/val/part-0-00000.npy
+
+data:
+  pad_direction: right
+  num_workers: 0
+  drop_last: true
+  pin_memory: false
+  prefetch_factor: null
+  persistent_workers: false
+  memmap_dtype: uint32
+  instance_filter: null
+  paths:
+    - http://olmo-data.org/preprocessed/olmo-mix/danyh-compiled-v1_7/documents/wiki/allenai/dolma2-tokenizer/part-0-00000.npy
+
+max_grad_norm: 1.0
+
+speed_monitor:
+  window_size: 1
+
+gen1_gc_interval: null
+
+console_log_interval: 1
+canceled_check_interval: 1000
