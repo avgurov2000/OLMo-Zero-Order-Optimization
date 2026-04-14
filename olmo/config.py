@@ -502,6 +502,8 @@ class OptimizerType(StrEnum):
     mezo = "mezo"
     lozo = "lozo"
     zo_adam = "zo_adam"
+    ldsd_muon = "ldsd_muon"
+    ldsd_sign_sgd = "ldsd_sign_sgd"
 
 
 @dataclass
@@ -553,7 +555,10 @@ class OptimizerConfig(BaseConfig):
     """MeZO-only: momentum on the estimated gradient direction."""
 
     mezo_vector_sampling_type: str = "standard_normal"
-    """MeZO / ZoAdam: ``standard_normal`` or ``lp_sphere`` for the probing direction ``z``."""
+    """MeZO / ZoAdam / LDSD: ``standard_normal`` or ``lp_sphere`` for the probing direction ``z``."""
+
+    ldsd_muon_newtonschulz_steps: int = 5
+    """LDSDMuon: number of Newton-Schulz iterations for orthogonalising the 2-D gradient estimate."""
 
     def __post_init__(self):
         self.betas = tuple(self.betas)  # type: ignore[assignment]

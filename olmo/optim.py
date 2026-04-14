@@ -949,10 +949,17 @@ def _zo_param_groups(cfg: TrainConfig, model: nn.Module) -> List[Dict[str, Any]]
 
 
 def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer:
-    if cfg.optimizer.name in (OptimizerType.mezo, OptimizerType.lozo, OptimizerType.zo_adam):
+    _zo_types = (
+        OptimizerType.mezo,
+        OptimizerType.lozo,
+        OptimizerType.zo_adam,
+        OptimizerType.ldsd_muon,
+        OptimizerType.ldsd_sign_sgd,
+    )
+    if cfg.optimizer.name in _zo_types:
         if cfg.distributed_strategy == DistributedStrategy.fsdp:
             raise OLMoConfigurationError(
-                "MeZO, LOZO, and ZoAdam require full weights on each process; they are not supported with FSDP. "
+                "Zero-order optimizers require full weights on each process; they are not supported with FSDP. "
                 "Use distributed_strategy: single or ddp."
             )
         if cfg.optimizer.zo_perturbation_mode not in ("two_side", "one_side"):
@@ -1025,6 +1032,34 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             eps=cfg.optimizer.eps,
             perturbation_mode=cfg.optimizer.zo_perturbation_mode,
             weight_decay=cfg.optimizer.weight_decay,
+            vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
+        )
+    elif cfg.optimizer.name == OptimizerType.ldsd_muon:
+        from .ldsd_optim import LDSDMuon
+
+        zg = _zo_param_groups(cfg, model)
+        return LDSDMuon(
+            zg,
+            lr=cfg.optimizer.learning_rate,
+            zo_eps=cfg.optimizer.zo_eps,
+            perturbation_mode=cfg.optimizer.zo_perturbation_mode,
+            weight_decay=cfg.optimizer.weight_decay,
+            vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
+            newtonschulz_steps=cfg.optimizer.ldsd_muon_newtonschulz_steps,
+        )
+    elif cfg.optimizer.name == OptimizerType.ldsd_sign_sgd:
+        from .ldsd_optim import LDSDSignSgd
+
+        zg = _zo_param_groups(cfg, model)
+        for g in zg:
+            g["momentum"] = cfg.optimizer.mezo_momentum
+        return LDSDSignSgd(
+            zg,
+            lr=cfg.optimizer.learning_rate,
+            zo_eps=cfg.optimizer.zo_eps,
+            perturbation_mode=cfg.optimizer.zo_perturbation_mode,
+            weight_decay=cfg.optimizer.weight_decay,
+            momentum=cfg.optimizer.mezo_momentum,
             vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
         )
     else:
