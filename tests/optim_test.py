@@ -211,6 +211,128 @@ def test_ldsd_sign_sgd_one_step_cpu():
     assert "grad_est_norm" in metrics
 
 
+def test_ldsd_rl_not_supported_with_fsdp():
+    cfg = TrainConfig()
+    cfg.optimizer.name = OptimizerType.ldsd_rl
+    cfg.distributed_strategy = DistributedStrategy.fsdp
+    model = OLMo(ModelConfig())
+    with pytest.raises(OLMoConfigurationError, match="FSDP"):
+        build_optimizer(cfg, model)
+
+
+def test_ldsd_rl_adamm_not_supported_with_fsdp():
+    cfg = TrainConfig()
+    cfg.optimizer.name = OptimizerType.ldsd_rl_adamm
+    cfg.distributed_strategy = DistributedStrategy.fsdp
+    model = OLMo(ModelConfig())
+    with pytest.raises(OLMoConfigurationError, match="FSDP"):
+        build_optimizer(cfg, model)
+
+
+def test_ldsd_rl_one_step_cpu():
+    cfg = TrainConfig()
+    cfg.optimizer.name = OptimizerType.ldsd_rl
+    cfg.distributed_strategy = DistributedStrategy.single
+    cfg.optimizer.learning_rate = 1e-3
+    cfg.optimizer.zo_eps = 1e-2
+    cfg.optimizer.ldsd_rl_k = 3          # small k so the test is fast
+    cfg.optimizer.ldsd_rl_params_ratio = 0.5
+    model = OLMo(ModelConfig())
+    model.train()
+    opt = build_optimizer(cfg, model)
+    batch = {"input_ids": torch.randint(0, model.config.vocab_size, (1, 16))}
+    closure = _make_closure(model, batch)
+
+    loss = opt.step(closure, z_seed=42)
+    assert isinstance(loss.item(), float)
+
+    metrics = opt.get_post_step_metrics()
+    assert "projected_grad_abs" in metrics
+    assert "avg_mu_norm" in metrics
+    assert metrics["projected_grad_abs"].item() >= 0.0
+
+
+def test_ldsd_rl_metrics_keys():
+    """get_post_step_metrics must return all documented keys after one step."""
+    cfg = TrainConfig()
+    cfg.optimizer.name = OptimizerType.ldsd_rl
+    cfg.distributed_strategy = DistributedStrategy.single
+    cfg.optimizer.learning_rate = 1e-3
+    cfg.optimizer.zo_eps = 1e-2
+    cfg.optimizer.ldsd_rl_k = 2
+    model = OLMo(ModelConfig())
+    model.train()
+    opt = build_optimizer(cfg, model)
+    batch = {"input_ids": torch.randint(0, model.config.vocab_size, (1, 16))}
+    opt.step(_make_closure(model, batch), z_seed=1)
+    m = opt.get_post_step_metrics()
+    for key in ("projected_grad_abs", "avg_mu_norm"):
+        assert key in m, f"missing metric: {key}"
+
+
+def test_ldsd_rl_adamm_one_step_cpu():
+    cfg = TrainConfig()
+    cfg.optimizer.name = OptimizerType.ldsd_rl_adamm
+    cfg.distributed_strategy = DistributedStrategy.single
+    cfg.optimizer.learning_rate = 1e-3
+    cfg.optimizer.zo_eps = 1e-2
+    cfg.optimizer.ldsd_rl_k = 3
+    model = OLMo(ModelConfig())
+    model.train()
+    opt = build_optimizer(cfg, model)
+    batch = {"input_ids": torch.randint(0, model.config.vocab_size, (1, 16))}
+    closure = _make_closure(model, batch)
+
+    loss = opt.step(closure, z_seed=7)
+    assert isinstance(loss.item(), float)
+
+    metrics = opt.get_post_step_metrics()
+    assert "projected_grad_abs" in metrics
+    assert "avg_mu_norm" in metrics
+    assert "avg_mu_norm_diff" in metrics
+    assert "avg_mu_grad_norm" in metrics
+
+
+def test_ldsd_rl_adamm_moments_update():
+    """exp_avg must be non-zero after one step (moments are being accumulated)."""
+    cfg = TrainConfig()
+    cfg.optimizer.name = OptimizerType.ldsd_rl_adamm
+    cfg.distributed_strategy = DistributedStrategy.single
+    cfg.optimizer.learning_rate = 1e-3
+    cfg.optimizer.zo_eps = 1e-2
+    cfg.optimizer.ldsd_rl_k = 2
+    model = OLMo(ModelConfig())
+    model.train()
+    opt = build_optimizer(cfg, model)
+    batch = {"input_ids": torch.randint(0, model.config.vocab_size, (1, 16))}
+    opt.step(_make_closure(model, batch), z_seed=99)
+
+    any_nonzero = any(
+        opt.state[p]["exp_avg"].abs().max().item() > 0
+        for group in opt.param_groups
+        for p in group["params"]
+        if p.requires_grad
+    )
+    assert any_nonzero, "exp_avg is all-zero after one step"
+
+
+def test_ldsd_rl_k1_no_crash():
+    """k=1 edge case: coeff is zero, mu update should be a no-op."""
+    cfg = TrainConfig()
+    cfg.optimizer.name = OptimizerType.ldsd_rl
+    cfg.distributed_strategy = DistributedStrategy.single
+    cfg.optimizer.learning_rate = 1e-3
+    cfg.optimizer.zo_eps = 1e-2
+    cfg.optimizer.ldsd_rl_k = 1
+    cfg.optimizer.ldsd_rl_params_ratio = 1.0
+    model = OLMo(ModelConfig())
+    model.train()
+    opt = build_optimizer(cfg, model)
+    batch = {"input_ids": torch.randint(0, model.config.vocab_size, (1, 16))}
+    loss = opt.step(_make_closure(model, batch), z_seed=5)
+    assert isinstance(loss.item(), float)
+
+
 def test_ldsd_sign_sgd_step_size_insensitive_to_loss_scale():
     """SignSGD: doubling the loss should not change the update direction or magnitude."""
     import copy
