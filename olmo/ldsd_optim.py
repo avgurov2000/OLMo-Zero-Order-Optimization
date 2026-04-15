@@ -652,10 +652,14 @@ class LDSDRlAdaMM(ZeroOrderOptimizer):
                     continue
                 state = self.state[p]
                 state["step"] = 0
-                state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                state["max_exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                state["mu"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                # Store moments and μ in bf16 to halve optimizer state memory.
+                # With amp_bf16, params are fp32 master weights; 5 fp32 buffers
+                # would cost ~30 GB for 1.5B params.  bf16 costs ~7.5 GB.
+                _bf16 = torch.bfloat16
+                state["exp_avg"] = torch.zeros_like(p, dtype=_bf16, memory_format=torch.preserve_format)
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=_bf16, memory_format=torch.preserve_format)
+                state["max_exp_avg_sq"] = torch.zeros_like(p, dtype=_bf16, memory_format=torch.preserve_format)
+                state["mu"] = torch.zeros_like(p, dtype=_bf16, memory_format=torch.preserve_format)
                 state["mu_old"] = state["mu"].detach().clone()
                 state["mu_old_norm_sq"] = 0.0
 
@@ -736,20 +740,22 @@ class LDSDRlAdaMM(ZeroOrderOptimizer):
                 if pgen is not ref_gen:
                     pgen.manual_seed(optimal_seed)
                 z = torch.normal(mean=mu, std=self.variance, generator=pgen)
-                grad = z.mul(projected_grad / zo_eps)
+                # In-place scale: avoids allocating a separate grad tensor.
+                z.mul_(projected_grad / zo_eps)
+                grad = z
 
                 if weight_decay != 0.0:
                     p.data.mul_(1.0 - lr * weight_decay)
 
                 state["exp_avg"].mul_(beta1).add_(grad, alpha=1.0 - beta1)
                 state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-                state["max_exp_avg_sq"] = torch.maximum(
-                    state["max_exp_avg_sq"], state["exp_avg_sq"]
-                )
-                # AMSGrad update (no bias correction, matches ZO_RL_AdaMM original).
+                # out= avoids allocating a new tensor on every step.
+                torch.maximum(state["max_exp_avg_sq"], state["exp_avg_sq"], out=state["max_exp_avg_sq"])
+                # AMSGrad update: cast bf16 states to param dtype (fp32 in amp_bf16).
+                p_dtype = p.data.dtype
                 p.data.addcdiv_(
-                    state["exp_avg"],
-                    state["max_exp_avg_sq"].sqrt().add_(1e-10),
+                    state["exp_avg"].to(p_dtype),
+                    (state["max_exp_avg_sq"].sqrt() + 1e-10).to(p_dtype),
                     value=-lr,
                 )
 
@@ -769,7 +775,9 @@ class LDSDRlAdaMM(ZeroOrderOptimizer):
                     gen = self._get_generator(p.device)
                     gen.manual_seed(seed)
                     z_i = torch.normal(mean=mu, std=self.variance, generator=gen)
-                    mu_diff.add_(mu - z_i, alpha=coeff[i].item())
+                    # Compute (mu - z_i) in-place to avoid an extra allocation.
+                    z_i.neg_().add_(mu)
+                    mu_diff.add_(z_i, alpha=coeff[i].item())
 
                 g_mu = mu_diff.neg_().div_(self.k * self.variance ** 2)
                 state["mu"].add_(g_mu, alpha=-self.lr_mu)
@@ -806,4 +814,5 @@ class LDSDRlAdaMM(ZeroOrderOptimizer):
                 if pgen is not ref_gen:
                     pgen.manual_seed(seed)
                 z = torch.normal(mean=mu, std=self.variance, generator=pgen)
-                p.data.add_(z, alpha=scaling_factor * zo_eps)
+                # mu is bf16; cast z to param dtype (fp32 in amp_bf16) for in-place add.
+                p.data.add_(z.to(p.data.dtype), alpha=scaling_factor * zo_eps)
