@@ -1,0 +1,163 @@
+# OLMo2-1B на wiki-датасете с оптимизатором LDSDMuon (ZO-MUON из ZO-LDSD).
+# DDP, 2 GPU. ZO-MUON применяет Newton-Schulz ортогонализацию к оценке градиента
+# для 2D-параметров и sign-компрессию для 1D.
+#
+# Запуск:
+#   uv run torchrun --nproc_per_node=2 scripts/train.py configs/wiki/OLMo2-1B-wiki-ddp-ldsd-muon.yaml
+#
+# global_train_batch_size=512 делится на 1, 2, 4, 8 GPU без остатка.
+# Для 3 GPU возьмите 510 или 480.
+#
+# Один шаг LDSDMuon = 2 прохода по микробатчам (two_side: f+ и f-).
+# При OOM уменьшайте device_train_microbatch_size (с 4 до 2 или 1).
+#
+# IPv6 / localhost:
+#   export MASTER_ADDR=127.0.0.1
+
+run_name: OLMo2-1B-wiki-ddp-ldsd-muon
+seed: 6198
+dry_run: false
+
+wandb:
+  name: ${run_name}
+  project: olmo-wiki
+  group: ${run_name}
+  entity: null
+
+model:
+  d_model: 2048
+  n_heads: 16
+  n_layers: 16
+  mlp_ratio: 8
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_theta: 500000
+
+  flash_attention: true
+  attention_dropout: 0.0
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1e-6
+  bias_for_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  norm_after: true
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 1024
+  vocab_size: 100278
+  embedding_size: 100352
+  eos_token_id: 100257
+  pad_token_id: 100277
+  init_device: cuda
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+
+softmax_auxiliary_loss: true
+auxiliary_loss_multiplier: 1e-5
+fused_loss: false
+
+compile: null
+
+optimizer:
+  name: ldsd_muon
+  # LDSDMuon: Newton-Schulz нормирует направление обновления для матриц,
+  # поэтому lr можно брать чуть выше, чем у MeZO/LOZO.
+  # Диапазон для поиска: [5e-5, 5e-4]; 2e-4 — хороший старт.
+  learning_rate: 2.0e-4
+  weight_decay: 0.1
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  metrics_log_interval: 1
+  # zo_eps управляет масштабом пертурбации. При слишком маленьком ε
+  # оценка градиента зашумлена; при большом — нелинейность доминирует.
+  # 1e-3 хорошо работает для MeZO/ZoAdam на аналогичных моделях.
+  zo_eps: 1.0e-3
+  zo_perturbation_mode: two_side
+  mezo_vector_sampling_type: standard_normal
+  ldsd_muon_newtonschulz_steps: 5
+
+scheduler:
+  name: cosine_with_warmup
+  units: tokens
+  t_warmup: 200000000
+  t_max: 3660000000
+  alpha_f: 0.1
+  warmup_min_lr: 0.0
+
+tokenizer:
+  identifier: tokenizers/allenai_dolma2.json
+  truncate_direction: right
+
+save_folder: ./runs/OLMo2-1B-wiki-ddp-ldsd-muon
+save_overwrite: false
+
+save_interval: 1000
+save_interval_ephemeral: 1000
+save_num_checkpoints_to_keep: 2
+save_interval_unsharded: 1000
+save_num_unsharded_checkpoints_to_keep: 2
+
+load_path: null
+
+global_train_batch_size: 512
+device_train_microbatch_size: 4
+
+max_duration: 1247322704T
+
+precision: amp_bf16
+
+distributed_strategy: ddp
+
+ddp:
+  grad_sync_mode: batch
+  find_unused_params: false
+
+max_grad_norm: 1.0
+max_grad_norm_ratio: null
+
+speed_monitor:
+  window_size: 1
+
+gen1_gc_interval: 10
+
+eval_interval: 1000
+eval_subset_num_batches: -1
+device_eval_batch_size: ${device_train_microbatch_size}
+
+evaluators:
+  - label: dolma_wiki-validation
+    type: lm
+    data:
+      pad_direction: right
+      num_workers: 4
+      drop_last: true
+      pin_memory: true
+      prefetch_factor: 2
+      persistent_workers: true
+      memmap_dtype: uint32
+      paths:
+        - /home/gur_andry/data/wikitext/validation/0_00000.npy
+
+data:
+  pad_direction: right
+  num_workers: 8
+  drop_last: true
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  memmap_dtype: uint32
+  timeout: 0
+  instance_filter:
+    repetition_max_period: 13
+    repetition_min_period: 1
+    repetition_max_count: 32
+  paths:
+    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00000.npy
+    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00001.npy
+    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00002.npy
