@@ -506,6 +506,7 @@ class OptimizerType(StrEnum):
     ldsd_sign_sgd = "ldsd_sign_sgd"
     ldsd_rl = "ldsd_rl"
     ldsd_rl_adamm = "ldsd_rl_adamm"
+    ldsd_rl_sgd = "ldsd_rl_sgd"
 
 
 @dataclass
@@ -573,6 +574,9 @@ class OptimizerConfig(BaseConfig):
 
     ldsd_rl_params_ratio: float = 0.1
     """LDSDRl: fraction of trainable parameters perturbed per step (sparse exploration)."""
+
+    ldsd_rl_sgd_momentum: float = 0.9
+    """LDSDRlSgd: SGD momentum coefficient (0.0 = vanilla SGD without momentum)."""
 
     def __post_init__(self):
         self.betas = tuple(self.betas)  # type: ignore[assignment]

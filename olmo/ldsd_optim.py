@@ -816,3 +816,217 @@ class LDSDRlAdaMM(ZeroOrderOptimizer):
                 z = torch.normal(mean=mu, std=self.variance, generator=pgen)
                 # mu is bf16; cast z to param dtype (fp32 in amp_bf16) for in-place add.
                 p.data.add_(z.to(p.data.dtype), alpha=scaling_factor * zo_eps)
+
+
+# ---------------------------------------------------------------------------
+# LDSDRlSgd
+# ---------------------------------------------------------------------------
+
+class LDSDRlSgd(ZeroOrderOptimizer):
+    """ZO_RL_SGD from ZO-LDSD adapted to OLMo's interface.
+
+    RL-based direction learning (k-candidate exploration, same as LDSDRlAdaMM)
+    with vanilla SGD (optional momentum) for the parameter update.
+    All parameters are perturbed every step (no sparse selection).
+
+    Algorithm:
+      Phase 1 — evaluate k candidate perturbations, select the one with lowest loss.
+      Phase 2 — two-sided FD along the optimal direction (reuses loss_plus from phase 1).
+      Phase 3 — SGD (+ optional momentum) parameter update using the projected gradient.
+      Phase 4 — μ direction update via ES natural gradient.
+
+    Total forward passes per step: k + 1 (k exploration + 1 for loss_minus in FD).
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        zo_eps: float = 1e-3,
+        momentum: float = 0.0,
+        k: int = 10,
+        variance: float = 1e-3,
+        lr_mu: Optional[float] = None,
+        perturbation_mode: str = "two_side",
+        weight_decay: float = 0.0,
+    ):
+        if lr < 0:
+            raise ValueError(f"Invalid lr: {lr}")
+        if zo_eps <= 0:
+            raise ValueError(f"Invalid zo_eps: {zo_eps}")
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+
+        defaults = dict(lr=lr, zo_eps=zo_eps, weight_decay=weight_decay, momentum=momentum)
+        super().__init__(params, defaults)
+        self.k = k
+        self.variance = variance
+        self.lr_mu = lr_mu if lr_mu is not None else lr
+        self._perturbation_mode = perturbation_mode
+        self._generators: dict[torch.device, torch.Generator] = {}
+        self._last_metrics: dict[str, float] = {}
+
+        self._all_trainable = [
+            p for g in self.param_groups for p in g["params"] if p.requires_grad
+        ]
+
+        # μ in bf16 to halve optimizer state memory (same rationale as LDSDRlAdaMM).
+        # momentum_buffer is created lazily on the first step that uses it.
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                state = self.state[p]
+                state["step"] = 0
+                _bf16 = torch.bfloat16
+                state["mu"] = torch.zeros_like(p, dtype=_bf16, memory_format=torch.preserve_format)
+                state["mu_old"] = state["mu"].detach().clone()
+
+    # ------------------------------------------------------------------
+    def _get_generator(self, device: torch.device) -> torch.Generator:
+        if device not in self._generators:
+            self._generators[device] = torch.Generator(device=device)
+        return self._generators[device]
+
+    def get_post_step_metrics(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+        """Return ZO diagnostics from the last step.
+
+        projected_grad_abs
+            |(f+ − f−) / 2| along the optimal direction.
+        avg_mu_norm
+            Mean L2 norm of μ across all trainable parameters.
+        avg_mu_norm_diff
+            Mean per-parameter change in ‖μ‖ this step.
+        avg_mu_grad_norm
+            Mean per-parameter L2 norm of the μ gradient.
+        """
+        return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def step(
+        self,
+        closure: Callable[[], torch.Tensor],
+        z_seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        if z_seed is None:
+            z_seed = int(np.random.randint(0, 1_000_000_000))
+
+        seed_rng = np.random.RandomState(z_seed)
+        candidate_seeds = [int(seed_rng.randint(0, 1_000_000_000)) for _ in range(self.k)]
+
+        # --- Phase 1: evaluate k candidates ---
+        loss_per_seed: dict[int, float] = {}
+        for seed in candidate_seeds:
+            self._perturb_full(seed, +1.0)
+            loss_per_seed[seed] = closure().item()
+            self._perturb_full(seed, -1.0)  # restore
+
+        optimal_seed = min(loss_per_seed, key=loss_per_seed.__getitem__)
+
+        # --- Phase 2: two-sided FD along optimal direction ---
+        # Reuse loss_plus already computed in phase 1 (k+1 passes total, not k+2).
+        loss_plus = torch.tensor(loss_per_seed[optimal_seed])
+        self._perturb_full(optimal_seed, -1.0)
+        loss_minus = closure()
+        projected_grad = (loss_plus - loss_minus).item() / 2.0
+        self._perturb_full(optimal_seed, +1.0)  # restore to θ
+
+        # --- Phase 3: SGD (+ optional momentum) parameter update ---
+        f_vals = torch.tensor([loss_per_seed[s] for s in candidate_seeds])
+        f_sum = f_vals.sum()
+        coeff = (f_vals * self.k - f_sum) / max(self.k - 1, 1)
+
+        ref_device = self._all_trainable[0].device
+        ref_gen = self._get_generator(ref_device)
+        ref_gen.manual_seed(optimal_seed)
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            zo_eps = group["zo_eps"]
+            weight_decay = group["weight_decay"]
+            mom = group["momentum"]
+
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                state = self.state[p]
+                state["step"] += 1
+                mu = state["mu"]
+                pgen = self._get_generator(p.device)
+                if pgen is not ref_gen:
+                    pgen.manual_seed(optimal_seed)
+                z = torch.normal(mean=mu, std=self.variance, generator=pgen)
+                # In-place scale to grad; cast to param dtype (fp32 in amp_bf16).
+                z.mul_(projected_grad / zo_eps)
+                grad = z.to(p.data.dtype)
+
+                if weight_decay != 0.0:
+                    p.data.mul_(1.0 - lr * weight_decay)
+
+                if mom != 0.0:
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(
+                            p, dtype=torch.bfloat16, memory_format=torch.preserve_format
+                        )
+                    buf = state["momentum_buffer"]
+                    buf.mul_(mom).add_(grad)
+                    p.data.add_(buf.to(p.data.dtype), alpha=-lr)
+                else:
+                    p.data.add_(grad, alpha=-lr)
+
+        # --- Phase 4: μ update ---
+        mu_norm_diff_sq = 0.0
+        mu_grad_norm_sq = 0.0
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                state = self.state[p]
+                mu = state["mu"]
+                mu_diff = torch.zeros_like(mu)
+
+                for i, seed in enumerate(candidate_seeds):
+                    gen = self._get_generator(p.device)
+                    gen.manual_seed(seed)
+                    z_i = torch.normal(mean=mu, std=self.variance, generator=gen)
+                    z_i.neg_().add_(mu)
+                    mu_diff.add_(z_i, alpha=coeff[i].item())
+
+                g_mu = mu_diff.neg_().div_(self.k * self.variance ** 2)
+                state["mu"].add_(g_mu, alpha=-self.lr_mu)
+
+                mu_norm_diff_sq += (state["mu"] - state["mu_old"]).norm().item() ** 2
+                mu_grad_norm_sq += g_mu.norm().item() ** 2
+
+                state["mu_old"].copy_(state["mu"])
+
+        # Metrics.
+        n = max(len(self._all_trainable), 1)
+        self._last_metrics["projected_grad_abs"] = abs(projected_grad)
+        self._last_metrics["avg_mu_norm"] = (
+            sum(self.state[p]["mu"].norm().item() for p in self._all_trainable) / n
+        )
+        self._last_metrics["avg_mu_norm_diff"] = math.sqrt(max(mu_norm_diff_sq, 0.0)) / n
+        self._last_metrics["avg_mu_grad_norm"] = math.sqrt(max(mu_grad_norm_sq, 0.0)) / n
+        return loss_plus
+
+    # ------------------------------------------------------------------
+    def _perturb_full(self, seed: int, scaling_factor: float) -> None:
+        """Perturb ALL params; generator seeded once and advances sequentially."""
+        ref_device = self._all_trainable[0].device
+        ref_gen = self._get_generator(ref_device)
+        ref_gen.manual_seed(seed)
+        for group in self.param_groups:
+            zo_eps = group["zo_eps"]
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                mu = self.state[p]["mu"]
+                pgen = self._get_generator(p.device)
+                if pgen is not ref_gen:
+                    pgen.manual_seed(seed)
+                z = torch.normal(mean=mu, std=self.variance, generator=pgen)
+                # mu is bf16; cast z to param dtype (fp32 in amp_bf16) for in-place add.
+                p.data.add_(z.to(p.data.dtype), alpha=scaling_factor * zo_eps)

@@ -333,6 +333,64 @@ def test_ldsd_rl_k1_no_crash():
     assert isinstance(loss.item(), float)
 
 
+def test_ldsd_rl_sgd_not_supported_with_fsdp():
+    cfg = TrainConfig()
+    cfg.optimizer.name = OptimizerType.ldsd_rl_sgd
+    cfg.distributed_strategy = DistributedStrategy.fsdp
+    model = OLMo(ModelConfig())
+    with pytest.raises(OLMoConfigurationError, match="FSDP"):
+        build_optimizer(cfg, model)
+
+
+def test_ldsd_rl_sgd_one_step_cpu():
+    cfg = TrainConfig()
+    cfg.optimizer.name = OptimizerType.ldsd_rl_sgd
+    cfg.distributed_strategy = DistributedStrategy.single
+    cfg.optimizer.learning_rate = 1e-3
+    cfg.optimizer.zo_eps = 1e-2
+    cfg.optimizer.ldsd_rl_k = 3
+    cfg.optimizer.ldsd_rl_sgd_momentum = 0.0
+    model = OLMo(ModelConfig())
+    model.train()
+    opt = build_optimizer(cfg, model)
+    batch = {"input_ids": torch.randint(0, model.config.vocab_size, (1, 16))}
+    closure = _make_closure(model, batch)
+
+    loss = opt.step(closure, z_seed=7)
+    assert isinstance(loss.item(), float)
+
+    metrics = opt.get_post_step_metrics()
+    assert "projected_grad_abs" in metrics
+    assert "avg_mu_norm" in metrics
+    assert "avg_mu_norm_diff" in metrics
+    assert "avg_mu_grad_norm" in metrics
+    assert metrics["projected_grad_abs"].item() >= 0.0
+
+
+def test_ldsd_rl_sgd_momentum_buffer():
+    """momentum_buffer must be non-zero after one step with momentum != 0."""
+    cfg = TrainConfig()
+    cfg.optimizer.name = OptimizerType.ldsd_rl_sgd
+    cfg.distributed_strategy = DistributedStrategy.single
+    cfg.optimizer.learning_rate = 1e-3
+    cfg.optimizer.zo_eps = 1e-2
+    cfg.optimizer.ldsd_rl_k = 2
+    cfg.optimizer.ldsd_rl_sgd_momentum = 0.9
+    model = OLMo(ModelConfig())
+    model.train()
+    opt = build_optimizer(cfg, model)
+    batch = {"input_ids": torch.randint(0, model.config.vocab_size, (1, 16))}
+    opt.step(_make_closure(model, batch), z_seed=77)
+
+    any_nonzero = any(
+        opt.state[p]["momentum_buffer"].abs().max().item() > 0
+        for group in opt.param_groups
+        for p in group["params"]
+        if p.requires_grad and "momentum_buffer" in opt.state[p]
+    )
+    assert any_nonzero, "momentum_buffer is all-zero after one step"
+
+
 def test_ldsd_sign_sgd_step_size_insensitive_to_loss_scale():
     """SignSGD: doubling the loss should not change the update direction or magnitude."""
     import copy
