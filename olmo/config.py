@@ -504,6 +504,8 @@ class OptimizerType(StrEnum):
     zo_adam = "zo_adam"
     ldsd_muon = "ldsd_muon"
     ldsd_sign_sgd = "ldsd_sign_sgd"
+    ldsd_rl = "ldsd_rl"
+    ldsd_rl_adamm = "ldsd_rl_adamm"
 
 
 @dataclass
@@ -559,6 +561,18 @@ class OptimizerConfig(BaseConfig):
 
     ldsd_muon_newtonschulz_steps: int = 5
     """LDSDMuon: number of Newton-Schulz iterations for orthogonalising the 2-D gradient estimate."""
+
+    ldsd_rl_k: int = 10
+    """LDSDRl / LDSDRlAdaMM: number of candidate perturbation directions evaluated per step."""
+
+    ldsd_rl_variance: float = 1e-3
+    """LDSDRl / LDSDRlAdaMM: std of N(μ, variance·I) used to sample perturbation directions."""
+
+    ldsd_rl_beta: float = 0.9
+    """LDSDRl: momentum coefficient for gradient accumulator (grad_accum = β·accum + (1-β)·grad)."""
+
+    ldsd_rl_params_ratio: float = 0.1
+    """LDSDRl: fraction of trainable parameters perturbed per step (sparse exploration)."""
 
     def __post_init__(self):
         self.betas = tuple(self.betas)  # type: ignore[assignment]

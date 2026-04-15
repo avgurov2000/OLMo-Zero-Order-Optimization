@@ -955,6 +955,8 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
         OptimizerType.zo_adam,
         OptimizerType.ldsd_muon,
         OptimizerType.ldsd_sign_sgd,
+        OptimizerType.ldsd_rl,
+        OptimizerType.ldsd_rl_adamm,
     )
     if cfg.optimizer.name in _zo_types:
         if cfg.distributed_strategy == DistributedStrategy.fsdp:
@@ -1061,6 +1063,39 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             weight_decay=cfg.optimizer.weight_decay,
             momentum=cfg.optimizer.mezo_momentum,
             vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
+        )
+    elif cfg.optimizer.name == OptimizerType.ldsd_rl:
+        from .ldsd_optim import LDSDRl
+
+        zg = _zo_param_groups(cfg, model)
+        for g in zg:
+            g["beta"] = cfg.optimizer.ldsd_rl_beta
+        return LDSDRl(
+            zg,
+            lr=cfg.optimizer.learning_rate,
+            zo_eps=cfg.optimizer.zo_eps,
+            beta=cfg.optimizer.ldsd_rl_beta,
+            k=cfg.optimizer.ldsd_rl_k,
+            variance=cfg.optimizer.ldsd_rl_variance,
+            params_ratio=cfg.optimizer.ldsd_rl_params_ratio,
+            perturbation_mode=cfg.optimizer.zo_perturbation_mode,
+            weight_decay=cfg.optimizer.weight_decay,
+        )
+    elif cfg.optimizer.name == OptimizerType.ldsd_rl_adamm:
+        from .ldsd_optim import LDSDRlAdaMM
+
+        zg = _zo_param_groups(cfg, model)
+        for g in zg:
+            g["betas"] = cfg.optimizer.betas
+        return LDSDRlAdaMM(
+            zg,
+            lr=cfg.optimizer.learning_rate,
+            zo_eps=cfg.optimizer.zo_eps,
+            betas=cfg.optimizer.betas,
+            k=cfg.optimizer.ldsd_rl_k,
+            variance=cfg.optimizer.ldsd_rl_variance,
+            perturbation_mode=cfg.optimizer.zo_perturbation_mode,
+            weight_decay=cfg.optimizer.weight_decay,
         )
     else:
         raise NotImplementedError
