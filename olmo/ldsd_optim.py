@@ -478,12 +478,15 @@ class LDSDRl(ZeroOrderOptimizer):
         optimal_seed = min(loss_per_seed, key=loss_per_seed.__getitem__)
 
         # --- Phase 2: two-sided finite difference along optimal direction ---
+        # Reuse loss_plus from the candidate evaluation (same seed, same θ, same z).
+        # Re-run the sparse perturb to recover selected_ids for the optimal seed.
         selected_ids = self._sparse_perturb(optimal_seed, +1.0)
-        loss_plus = closure()
+        loss_plus = torch.tensor(loss_per_seed[optimal_seed])
+        # Params are now at θ + ε·z; go directly to θ - ε·z.
         self._sparse_restore(optimal_seed, selected_ids, -2.0)
         loss_minus = closure()
         projected_grad = (loss_plus - loss_minus).item() / 2.0
-        self._sparse_restore(optimal_seed, selected_ids, +1.0)  # restore
+        self._sparse_restore(optimal_seed, selected_ids, +1.0)  # restore to θ
 
         # --- Phase 3: parameter and μ update ---
         f_vals = torch.tensor([loss_per_seed[s] for s in candidate_seeds])
@@ -699,12 +702,13 @@ class LDSDRlAdaMM(ZeroOrderOptimizer):
         optimal_seed = min(loss_per_seed, key=loss_per_seed.__getitem__)
 
         # --- Phase 2: two-sided FD along optimal direction ---
-        self._perturb_full(optimal_seed, +1.0)
-        loss_plus = closure()
-        self._perturb_full(optimal_seed, -2.0)
+        # Reuse loss_plus from the candidate evaluation (same seed, same θ, same z).
+        loss_plus = torch.tensor(loss_per_seed[optimal_seed])
+        # Perturb to θ - ε·z directly (no need for +1 first).
+        self._perturb_full(optimal_seed, -1.0)
         loss_minus = closure()
         projected_grad = (loss_plus - loss_minus).item() / 2.0
-        self._perturb_full(optimal_seed, +1.0)  # restore
+        self._perturb_full(optimal_seed, +1.0)  # restore to θ
 
         # --- Phase 3: AdaMM parameter update ---
         f_vals = torch.tensor([loss_per_seed[s] for s in candidate_seeds])
