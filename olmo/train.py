@@ -886,6 +886,8 @@ class Trainer:
         loss = self.optim.step(closure, z_seed=z_seed)  # type: ignore[call-arg]
 
         ce_batch_loss = loss.detach()
+        if ce_batch_loss.device != self.device:
+            ce_batch_loss = ce_batch_loss.to(self.device)
         if reduce_global_loss:
             dist.reduce(ce_batch_loss, 0)
             ce_batch_loss.div_(get_world_size())

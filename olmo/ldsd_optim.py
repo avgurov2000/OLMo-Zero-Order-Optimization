@@ -706,11 +706,11 @@ class LDSDRlAdaMM(ZeroOrderOptimizer):
         optimal_seed = min(loss_per_seed, key=loss_per_seed.__getitem__)
 
         # --- Phase 2: two-sided FD along optimal direction ---
-        # Reuse loss_plus from the candidate evaluation (same seed, same θ, same z).
-        loss_plus = torch.tensor(loss_per_seed[optimal_seed])
         # Perturb to θ - ε·z directly (no need for +1 first).
         self._perturb_full(optimal_seed, -1.0)
         loss_minus = closure()
+        # Recreate f+ as a tensor on the same device/dtype as closure() output.
+        loss_plus = loss_minus.detach().new_tensor(loss_per_seed[optimal_seed])
         projected_grad = (loss_plus - loss_minus).item() / 2.0
         self._perturb_full(optimal_seed, +1.0)  # restore to θ
 
@@ -926,9 +926,10 @@ class LDSDRlSgd(ZeroOrderOptimizer):
 
         # --- Phase 2: two-sided FD along optimal direction ---
         # Reuse loss_plus already computed in phase 1 (k+1 passes total, not k+2).
-        loss_plus = torch.tensor(loss_per_seed[optimal_seed])
         self._perturb_full(optimal_seed, -1.0)
         loss_minus = closure()
+        # Recreate f+ as a tensor on the same device/dtype as closure() output.
+        loss_plus = loss_minus.detach().new_tensor(loss_per_seed[optimal_seed])
         projected_grad = (loss_plus - loss_minus).item() / 2.0
         self._perturb_full(optimal_seed, +1.0)  # restore to θ
 
