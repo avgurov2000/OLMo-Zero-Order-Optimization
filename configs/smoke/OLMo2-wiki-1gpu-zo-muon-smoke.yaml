@@ -1,0 +1,154 @@
+# Smoke-тест ZOMuon на одном GPU (маленькая модель, 5 шагов).
+# Проверяет: инициализацию P, антисимметричную оценку (num_samples=1),
+# метрики projected_grad_abs_mean и grad_est_norm, корректность шага.
+#
+# Запуск:
+#   uv run torchrun --nproc_per_node=1 scripts/train.py configs/smoke/OLMo2-wiki-1gpu-zo-muon-smoke.yaml
+#
+# Один шаг ZOMuon (num_samples=1) = 2 forward-прохода (антисимметричная оценка).
+# Для multi-sample: поставьте zo_muon_num_samples: 4 — будет 1+4 forward-прохода.
+#
+# При OOM: уменьшите global_train_batch_size или max_sequence_length.
+#
+# IPv6 / localhost:
+#   export MASTER_ADDR=127.0.0.1
+
+run_name: OLMo2-wiki-1gpu-zo-muon-smoke
+seed: 6198
+dry_run: false
+save_overwrite: true
+no_pre_train_checkpoint: true
+save_data_indices: false
+
+save_folder: ./.olmo-smoke-runs/wiki-1gpu-zo-muon-smoke
+save_interval: null
+save_interval_ephemeral: null
+save_num_checkpoints_to_keep: 0
+save_interval_unsharded: null
+save_num_unsharded_checkpoints_to_keep: 0
+
+load_path: null
+
+max_duration: 100
+stop_at: 5
+
+model:
+  d_model: 512
+  n_heads: 8
+  n_layers: 2
+  mlp_ratio: 8
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_theta: 500000
+  flash_attention: false
+  attention_dropout: 0.0
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1e-6
+  bias_for_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  norm_after: true
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 1024
+  vocab_size: 100278
+  embedding_size: 100352
+  eos_token_id: 100257
+  pad_token_id: 100277
+  init_device: cuda
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+
+softmax_auxiliary_loss: true
+auxiliary_loss_multiplier: 1e-5
+fused_loss: false
+
+compile: null
+
+optimizer:
+  name: zo_muon
+  # NS нормирует сингулярные значения → lr можно брать выше, чем у MeZO/LOZO.
+  learning_rate: 2.0e-4
+  weight_decay: 0.1
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  metrics_log_interval: 1
+  zo_eps: 1.0e-3
+  zo_perturbation_mode: two_side  # не используется в ZOMuon, но требуется валидатором
+  # ZOMuon-специфичные параметры:
+  zo_muon_rank: 4               # ранг проекции P; для smoke маленький
+  zo_muon_step_interval: 1      # обновлять P каждый шаг
+  zo_muon_num_samples: 1        # 1 → антисимметричная оценка (2 forward)
+  zo_muon_ns_steps: 5           # число итераций Newton-Schulz
+
+scheduler:
+  name: cosine_with_warmup
+  units: tokens
+  t_warmup: 200000000
+  t_max: 3660000000
+  alpha_f: 0.1
+  warmup_min_lr: 0.0
+
+tokenizer:
+  identifier: tokenizers/allenai_dolma2.json
+  truncate_direction: right
+
+global_train_batch_size: 8
+device_train_microbatch_size: 2
+
+precision: amp_bf16
+
+distributed_strategy: single
+
+max_grad_norm: 1.0
+max_grad_norm_ratio: null
+
+speed_monitor:
+  window_size: 1
+
+gen1_gc_interval: 10
+
+eval_interval: 1000
+eval_subset_num_batches: -1
+device_eval_batch_size: ${device_train_microbatch_size}
+
+evaluators:
+  - label: dolma_wiki-validation
+    type: lm
+    subset_num_batches: 2
+    data:
+      pad_direction: right
+      num_workers: 0
+      drop_last: true
+      pin_memory: false
+      prefetch_factor: null
+      persistent_workers: false
+      memmap_dtype: uint32
+      paths:
+        - http://olmo-data.org/eval-data/perplexity/v3_small_dolma2-tokenizer/dolma_wiki/val/part-0-00000.npy
+
+data:
+  pad_direction: right
+  num_workers: 0
+  drop_last: true
+  pin_memory: false
+  prefetch_factor: null
+  persistent_workers: false
+  memmap_dtype: uint32
+  timeout: 0
+  instance_filter:
+    repetition_max_period: 13
+    repetition_min_period: 1
+    repetition_max_count: 32
+  paths:
+    - http://olmo-data.org/preprocessed/olmo-mix/danyh-compiled-v1_7/documents/wiki/allenai/dolma2-tokenizer/part-0-00000.npy
+    - http://olmo-data.org/preprocessed/olmo-mix/danyh-compiled-v1_7/documents/wiki/allenai/dolma2-tokenizer/part-1-00000.npy
+
+console_log_interval: 1
+canceled_check_interval: 1000

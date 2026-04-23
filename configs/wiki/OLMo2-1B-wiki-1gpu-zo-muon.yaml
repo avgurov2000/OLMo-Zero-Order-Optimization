@@ -1,0 +1,174 @@
+# OLMo2-1B на wiki-датасете, оптимизатор ZOMuon (1 GPU).
+#
+# ZOMuon ("Powering Up Zeroth-Order Training via Subspace Gradient Orthogonalization"):
+#   - Каждый шаг сэмплирует Haar-ортогональную проекцию P ∈ R^(m × rank),
+#     обновляемую раз в step_interval шагов.
+#   - Накапливает num_samples одностороннних оценок в подпространстве:
+#       lowdim_rge = (1/N) Σᵢ scalarᵢ · uᵢ  (rank × n)
+#   - Применяет Newton-Schulz ортогонализацию → M_sign ≈ U Vᵀ.
+#   - Обновление: W -= lr · P @ M_sign.
+#   Один шаг = 1 + num_samples forward-проходов (при num_samples=1 — антисимм., 2 прохода).
+#   Без backward, без grad_clip.
+#
+# Параметры оптимизатора по статье (LLM-эксперименты):
+#   rank=64, step_interval=100, num_samples=4 → 5 forward-проходов за шаг.
+#   При num_samples=1 (по умолчанию ниже для экономии) — 2 прохода как у MeZO/LOZO.
+#
+# Запуск (один процесс):
+#   uv run torchrun --nproc_per_node=1 scripts/train.py configs/wiki/OLMo2-1B-wiki-1gpu-zo-muon.yaml
+#
+# Или без torchrun:
+#   CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py configs/wiki/OLMo2-1B-wiki-1gpu-zo-muon.yaml
+#
+# Память: ZOMuon хранит P (m × rank float32) на параметр.
+#   При rank=64 и 1B-модели: ~64 MB дополнительно. При rank=4: ~4 MB.
+#   При OOM: уменьшите device_train_microbatch_size или zo_muon_rank.
+#
+# IPv6 / localhost:
+#   export MASTER_ADDR=127.0.0.1
+
+run_name: OLMo2-1B-wiki-1gpu-zo-muon
+seed: 6198
+dry_run: false
+
+wandb:
+  name: ${run_name}
+  project: olmo-wiki
+  group: ${run_name}
+  entity: null
+
+model:
+  d_model: 2048
+  n_heads: 16
+  n_layers: 16
+  mlp_ratio: 8
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_theta: 500000
+  flash_attention: true
+  attention_dropout: 0.0
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1e-6
+  bias_for_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  norm_after: true
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 1024
+  vocab_size: 100278
+  embedding_size: 100352
+  eos_token_id: 100257
+  pad_token_id: 100277
+  init_device: cuda
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+
+softmax_auxiliary_loss: true
+auxiliary_loss_multiplier: 1e-5
+fused_loss: false
+
+compile: null
+
+optimizer:
+  name: zo_muon
+  # NS нормирует сингулярные значения update-направления → lr устойчив к масштабу градиента.
+  # Рекомендуемый диапазон поиска: [5e-5, 5e-4]; 2e-4 — хороший старт.
+  learning_rate: 2.0e-4
+  weight_decay: 0.1
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  metrics_log_interval: 1
+  zo_eps: 1.0e-3
+  zo_perturbation_mode: two_side  # не используется в ZOMuon, но требуется валидатором
+  # --- ZOMuon параметры ---
+  # Значения из статьи для LLM-экспериментов:
+  zo_muon_rank: 64              # ранг проекции P; авторы используют 64
+  zo_muon_step_interval: 100    # P обновляется раз в 100 шагов
+  # num_samples=1: антисимметричная оценка (2 forward), экономичнее.
+  # num_samples=4: как в статье, 5 forward-проходов, меньше дисперсия.
+  # Для старта рекомендуется 1; при наличии GPU-времени попробуйте 4.
+  zo_muon_num_samples: 4
+  zo_muon_ns_steps: 5           # число итераций Newton-Schulz (5 стандартно)
+
+scheduler:
+  name: cosine_with_warmup
+  units: tokens
+  t_warmup: 62000000
+  t_max: 1247322704
+  alpha_f: 0.1
+  warmup_min_lr: 0.0
+
+tokenizer:
+  identifier: tokenizers/allenai_dolma2.json
+  truncate_direction: right
+
+save_folder: ./runs/OLMo2-1B-wiki-1gpu-zo-muon
+save_overwrite: false
+
+save_interval: 1000
+save_interval_ephemeral: 1000
+save_num_checkpoints_to_keep: 2
+save_interval_unsharded: 1000
+save_num_unsharded_checkpoints_to_keep: 2
+
+load_path: null
+
+global_train_batch_size: 512
+device_train_microbatch_size: 4
+
+max_duration: 1247322704T
+
+precision: amp_bf16
+
+distributed_strategy: single
+
+max_grad_norm: 1.0
+max_grad_norm_ratio: null
+
+speed_monitor:
+  window_size: 1
+
+gen1_gc_interval: 10
+
+eval_interval: 1000
+eval_subset_num_batches: -1
+device_eval_batch_size: ${device_train_microbatch_size}
+
+evaluators:
+  - label: dolma_wiki-validation
+    type: lm
+    data:
+      pad_direction: right
+      num_workers: 4
+      drop_last: true
+      pin_memory: true
+      prefetch_factor: 2
+      persistent_workers: true
+      memmap_dtype: uint32
+      paths:
+        - /home/gur_andry/data/wikitext/validation/0_00000.npy
+
+data:
+  pad_direction: right
+  num_workers: 8
+  drop_last: true
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  memmap_dtype: uint32
+  timeout: 0
+  instance_filter:
+    repetition_max_period: 13
+    repetition_min_period: 1
+    repetition_max_count: 32
+  paths:
+    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00000.npy
+    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00001.npy
+    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00002.npy
