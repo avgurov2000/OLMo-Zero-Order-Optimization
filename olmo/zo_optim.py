@@ -1,8 +1,12 @@
 """
-MeZO, LOZO, and ZoAdam zero-order optimizers for OLMo training.
+MeZO, LOZO, ZoAdam, and ZOMuon zero-order optimizers for OLMo training.
 
 Adapted from ``llm-base-zero-order`` (see also LOZO paper / optsuite).
 ZoAdam combines the MeZO / SPSA gradient estimate with AdamW-style moment updates.
+ZOMuon implements "Powering Up Zeroth-Order Training via Subspace Gradient
+Orthogonalization" (ZO-Muon): projects perturbations through a Haar-distributed
+orthogonal matrix P, accumulates multiple gradient estimates in the low-rank
+subspace, then orthogonalizes the result with Newton-Schulz before updating.
 """
 
 from __future__ import annotations
@@ -461,3 +465,284 @@ class LOZO(ZeroOrderOptimizer):
                 if weight_decay != 0.0:
                     p.data.mul_(1.0 - lr * weight_decay)
         self._last_metrics["grad_est_norm"] = math.sqrt(max(grad_sum_sq, 0.0))
+
+
+# ---------------------------------------------------------------------------
+# Newton-Schulz orthogonalization  (Muon / ZO-Muon building block)
+# ---------------------------------------------------------------------------
+
+def _newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Approximate matrix sign via Newton-Schulz iteration.
+
+    Maps G → U Vᵀ where G = U Σ Vᵀ, i.e. normalizes all singular values to ~1.
+    This is the "Muon" update rule from Kosson et al. and Vyas et al.
+    Always operates in float32 and returns float32.
+
+    Convergence requires spectral norm < sqrt(3); the initial normalisation
+    by ``X.norm()`` ensures this.
+    """
+    assert G.ndim == 2, "G must be a 2-D matrix"
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.to(torch.float32)
+    X = X / (X.norm() + eps)
+    if X.shape[0] > X.shape[1]:
+        X = X.T
+        transposed = True
+    else:
+        transposed = False
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if transposed:
+        X = X.T
+    return X
+
+
+# ---------------------------------------------------------------------------
+# ZOMuon
+# ---------------------------------------------------------------------------
+
+class ZOMuon(ZeroOrderOptimizer):
+    """Zeroth-Order optimizer with subspace gradient orthogonalization (ZO-Muon).
+
+    For 2-D weight matrices the algorithm:
+      1. Samples a Haar-distributed orthogonal projection ``P`` of shape
+         ``(m, rank)`` via QR; cached and refreshed every ``step_interval`` steps.
+      2. Accumulates ``num_samples`` gradient scalars in the low-rank subspace:
+           ``lowdim_rge = (1/N) Σᵢ scalar_i · uᵢ``   shape ``(rank, n)``
+         where each ``uᵢ ~ N(0,I)`` is the per-sample in-subspace direction.
+         With ``num_samples=1`` the antithetic two-sided estimator is used
+         (2 forward passes); with ``num_samples>1`` a one-sided centre-based
+         estimator is used (1+N forward passes, shared ``P``).
+      3. Applies Newton-Schulz orthogonalization:
+           ``M_sign = NS(lowdim_rge)``   (≈ U Vᵀ, singular values → 1)
+      4. Updates: ``W -= lr · P @ M_sign``
+
+    For 1-D parameters (biases, norms) a standard averaged MeZO-style update
+    is used without Newton-Schulz.
+
+    DDP: ``P`` is seeded from ``_step_count`` (globally synchronized across
+    ranks); ``uᵢ`` from the externally broadcast ``z_seed``.  The loss is
+    all-reduced inside the closure so all ranks compute identical scalars and
+    apply the same update without gradient communication.
+
+    FSDP is not supported (blocked in ``build_optimizer``).
+
+    Reference: "Powering Up Zeroth-Order Training via Subspace Gradient
+    Orthogonalization", 2024.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        zo_eps: float = 1e-3,
+        rank: int = 4,
+        step_interval: int = 1,
+        num_samples: int = 1,
+        ns_steps: int = 5,
+        weight_decay: float = 0.0,
+    ):
+        if lr < 0:
+            raise ValueError(f"Invalid lr: {lr}")
+        if zo_eps <= 0:
+            raise ValueError(f"Invalid zo_eps: {zo_eps}")
+        if rank < 1:
+            raise ValueError(f"Invalid rank: {rank}")
+        if num_samples < 1:
+            raise ValueError(f"Invalid num_samples: {num_samples}")
+        if ns_steps < 1:
+            raise ValueError(f"Invalid ns_steps: {ns_steps}")
+
+        defaults = dict(
+            lr=lr,
+            zo_eps=zo_eps,
+            rank=rank,
+            step_interval=step_interval,
+            num_samples=num_samples,
+            ns_steps=ns_steps,
+            weight_decay=weight_decay,
+        )
+        super().__init__(params, defaults)
+        self._step_count = 0
+        self._last_metrics: dict[str, float] = {}
+
+    def get_post_step_metrics(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+        """Return ZOMuon diagnostics from the last step.
+
+        Metrics
+        -------
+        projected_grad_abs_mean
+            Mean absolute SPSA scalar across all ``num_samples`` samples.
+            Measures the average signal strength in the probed subspace.
+        grad_est_norm
+            Global L2 / Frobenius norm of the update direction
+            ``P @ M_sign`` for 2-D params (plus standard norm for 1-D),
+            before ``lr`` scaling.  Because Newton-Schulz normalizes singular
+            values to ~1, this is roughly ``sqrt(rank · n_2d_params)``.
+        """
+        return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _flat_params(self):
+        idx = 0
+        for group in self.param_groups:
+            for p in group["params"]:
+                yield group, p, idx
+                idx += 1
+
+    def _get_or_refresh_p(self, p: torch.Tensor, param_idx: int) -> torch.Tensor:
+        """Return the cached Haar-orthogonal P, refreshing if the interval has elapsed."""
+        effective_rank = min(self.defaults["rank"], p.shape[0])
+        state = self.state[p]
+        last_refresh = state.get("p_refresh_step", -1)
+        should_refresh = (last_refresh < 0) or (
+            self._step_count - last_refresh >= self.defaults["step_interval"]
+        )
+        if should_refresh:
+            gen = torch.Generator(device=p.device)
+            gen.manual_seed(
+                (self._step_count * 1_000_003 + param_idx * 999_983) % (2**31)
+            )
+            Q = torch.randn(
+                p.shape[0], effective_rank, device=p.device, dtype=torch.float32, generator=gen
+            )
+            P, R = torch.linalg.qr(Q, mode="reduced")
+            # Haar sign correction: ensure uniform distribution over O(m, rank).
+            signs = R.diagonal().sign()
+            signs[signs == 0] = 1.0
+            P = P * signs  # float32, shape (m, effective_rank)
+            state["p_mat"] = P
+            state["p_refresh_step"] = self._step_count
+        return state["p_mat"]
+
+    def _get_u(
+        self, p: torch.Tensor, z_seed: int, param_idx: int, sample_idx: int
+    ) -> torch.Tensor:
+        """Sample uᵢ ~ N(0, I) of shape (rank, n_cols) for sample i. Always float32."""
+        effective_rank = min(self.defaults["rank"], p.shape[0])
+        gen = torch.Generator(device=p.device)
+        gen.manual_seed(
+            (z_seed + param_idx * 1_000_003 + sample_idx * 999_983) % (2**31)
+        )
+        return torch.randn(
+            effective_rank, p.shape[1], device=p.device, dtype=torch.float32, generator=gen
+        )
+
+    def _get_z1d(
+        self, p: torch.Tensor, z_seed: int, param_idx: int, sample_idx: int
+    ) -> torch.Tensor:
+        """Sample z ~ N(0, I) for 1-D params. Always float32."""
+        gen = torch.Generator(device=p.device)
+        gen.manual_seed(
+            (z_seed + param_idx * 999_983 + sample_idx * 111_317) % (2**31)
+        )
+        return torch.randn(p.shape, device=p.device, dtype=torch.float32, generator=gen)
+
+    def _perturb_sample(self, z_seed: int, sample_idx: int, scaling_factor: float) -> None:
+        """Perturb all parameters for one sample: θ += scaling * eps * P @ u (2D) or z (1D)."""
+        for group, p, idx in self._flat_params():
+            if not p.requires_grad:
+                continue
+            eps = group["zo_eps"]
+            if p.dim() == 2:
+                P = self._get_or_refresh_p(p, idx)
+                u = self._get_u(p, z_seed, idx, sample_idx)
+                p.data.addmm_(P.to(p.dtype), u.to(p.dtype), alpha=scaling_factor * eps)
+            else:
+                z = self._get_z1d(p, z_seed, idx, sample_idx)
+                p.data.add_(z.to(p.dtype), alpha=scaling_factor * eps)
+
+    # ------------------------------------------------------------------
+    # Step
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def step(self, closure: Callable[[], torch.Tensor], z_seed: Optional[int] = None) -> torch.Tensor:
+        if z_seed is None:
+            z_seed = int(np.random.randint(0, 1_000_000_000))
+
+        zo_eps = self.defaults["zo_eps"]
+        num_samples = self.defaults["num_samples"]
+        scalars: dict[int, float] = {}
+
+        if num_samples == 1:
+            # Two-sided antithetic: 2 forward passes, lower-variance estimator.
+            self._perturb_sample(z_seed, 0, +1.0)
+            loss_plus = closure()
+            self._perturb_sample(z_seed, 0, -2.0)
+            loss_minus = closure()
+            scalars[0] = (loss_plus - loss_minus).item() / (2.0 * zo_eps)
+            self._perturb_sample(z_seed, 0, +1.0)  # restore θ
+        else:
+            # One-sided centre-based: 1 + num_samples forward passes, shared P.
+            loss_center = closure()
+            loss_plus = loss_center  # fallback; overwritten below
+            for i in range(num_samples):
+                self._perturb_sample(z_seed, i, +1.0)
+                loss_plus_i = closure()
+                if i == 0:
+                    loss_plus = loss_plus_i  # return first sample's loss for logging
+                self._perturb_sample(z_seed, i, -1.0)  # restore θ
+                scalars[i] = (loss_plus_i - loss_center).item() / zo_eps
+
+        self._apply_update(scalars, z_seed)
+        self._last_metrics["projected_grad_abs_mean"] = (
+            sum(abs(s) for s in scalars.values()) / len(scalars)
+        )
+        self._step_count += 1
+        return loss_plus
+
+    def _apply_update(self, scalars: dict[int, float], z_seed: int) -> None:
+        ns_steps = self.defaults["ns_steps"]
+        n_samples = len(scalars)
+        grad_sum_sq = 0.0
+
+        for group, p, idx in self._flat_params():
+            if not p.requires_grad:
+                continue
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+
+            if p.dim() == 2:
+                P = self.state[p]["p_mat"]  # (m, effective_rank), float32
+                effective_rank = P.shape[1]
+
+                # Accumulate low-rank gradient estimate: (1/N) Σᵢ scalarᵢ · uᵢ
+                lowdim_rge = torch.zeros(
+                    effective_rank, p.shape[1], device=p.device, dtype=torch.float32
+                )
+                for sample_idx, scalar in scalars.items():
+                    u = self._get_u(p, z_seed, idx, sample_idx)
+                    lowdim_rge.add_(u, alpha=scalar)
+                lowdim_rge.div_(n_samples)
+
+                # Newton-Schulz: lowdim_rge → M_sign ≈ U Vᵀ  (singular values → 1)
+                M_sign = _newtonschulz5(lowdim_rge, steps=ns_steps)
+
+                # Full update direction G = P @ M_sign, shape (m, n)
+                G = P @ M_sign
+                grad_sum_sq += G.norm().item() ** 2
+
+                p.data.add_(G.to(p.dtype), alpha=-lr)
+                if weight_decay != 0.0:
+                    p.data.mul_(1.0 - lr * weight_decay)
+
+            else:
+                # 1-D: average the scalar gradient estimates, no orthogonalization.
+                grad_1d = torch.zeros(p.shape, device=p.device, dtype=torch.float32)
+                for sample_idx, scalar in scalars.items():
+                    z = self._get_z1d(p, z_seed, idx, sample_idx)
+                    grad_1d.add_(z, alpha=scalar)
+                grad_1d.div_(n_samples)
+
+                grad_sum_sq += grad_1d.norm().item() ** 2
+                p.data.add_(grad_1d.to(p.dtype), alpha=-lr)
+                if weight_decay != 0.0:
+                    p.data.mul_(1.0 - lr * weight_decay)
+
+        self._last_metrics["grad_est_norm"] = math.sqrt(grad_sum_sq)
