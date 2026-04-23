@@ -953,6 +953,7 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
         OptimizerType.mezo,
         OptimizerType.lozo,
         OptimizerType.zo_adam,
+        OptimizerType.zo_muon,
         OptimizerType.ldsd_muon,
         OptimizerType.ldsd_sign_sgd,
         OptimizerType.ldsd_rl,
@@ -1036,6 +1037,20 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             perturbation_mode=cfg.optimizer.zo_perturbation_mode,
             weight_decay=cfg.optimizer.weight_decay,
             vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
+        )
+    elif cfg.optimizer.name == OptimizerType.zo_muon:
+        from .zo_optim import ZOMuon
+
+        zg = _zo_param_groups(cfg, model)
+        return ZOMuon(
+            zg,
+            lr=cfg.optimizer.learning_rate,
+            zo_eps=cfg.optimizer.zo_eps,
+            rank=cfg.optimizer.zo_muon_rank,
+            step_interval=cfg.optimizer.zo_muon_step_interval,
+            num_samples=cfg.optimizer.zo_muon_num_samples,
+            ns_steps=cfg.optimizer.zo_muon_ns_steps,
+            weight_decay=cfg.optimizer.weight_decay,
         )
     elif cfg.optimizer.name == OptimizerType.ldsd_muon:
         from .ldsd_optim import LDSDMuon

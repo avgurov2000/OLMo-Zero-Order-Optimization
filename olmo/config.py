@@ -502,6 +502,7 @@ class OptimizerType(StrEnum):
     mezo = "mezo"
     lozo = "lozo"
     zo_adam = "zo_adam"
+    zo_muon = "zo_muon"
     ldsd_muon = "ldsd_muon"
     ldsd_sign_sgd = "ldsd_sign_sgd"
     ldsd_rl = "ldsd_rl"
@@ -553,6 +554,20 @@ class OptimizerConfig(BaseConfig):
 
     lozo_step_interval: int = 1
     """How often LOZO refreshes V; 1 = every step."""
+
+    zo_muon_rank: int = 4
+    """ZOMuon: rank r of the Haar-orthogonal projection P for 2-D parameters."""
+
+    zo_muon_step_interval: int = 1
+    """ZOMuon: how often P is refreshed; 1 = every step."""
+
+    zo_muon_num_samples: int = 1
+    """ZOMuon: number of gradient samples per step.
+    1 → antithetic two-sided estimator (2 forward passes).
+    N > 1 → one-sided centre-based estimator (1+N forward passes), lower variance."""
+
+    zo_muon_ns_steps: int = 5
+    """ZOMuon: number of Newton-Schulz iterations for orthogonalizing lowdim_rge."""
 
     mezo_momentum: float = 0.0
     """MeZO-only: momentum on the estimated gradient direction."""
