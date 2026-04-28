@@ -1,0 +1,162 @@
+# Полный OLMo-2-0425-1B (как stage1), обучение только на Wikipedia (olmo-mix, dolma2 tokenizer).
+# Расчёт на 3 GPU: global_train_batch_size и микробатч согласованы с grad accumulation.
+#
+#   CUDA_VISIBLE_DEVICES=0 uv run torchrun --nproc_per_node=1 scripts/train.py configs/slimpajame/OLMo2-360m-2gpu.yaml
+#
+# Память: при OOM уменьшите device_train_microbatch_size (должно делить batch на GPU).
+# Полный список downstream-евалов как в OLMo2-1B-stage1.yaml можно скопировать вместо блока evaluators ниже.
+
+run_name: OLMo2-360m-2gpu
+seed: 6198
+dry_run: false
+
+wandb:
+  name: ${run_name}
+  project: olmo-slimpajame
+  group: ${run_name}
+  entity: null
+
+model:
+  d_model: 896
+  n_heads: 14
+  n_layers: 16
+  mlp_ratio: 8
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_theta: 500000
+
+  flash_attention: true
+  attention_dropout: 0.0
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1e-6
+  bias_for_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  norm_after: true
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 4096
+  vocab_size: 100278
+  embedding_size: 100352
+  eos_token_id: 100257
+  pad_token_id: 100277
+  init_device: meta
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+
+softmax_auxiliary_loss: true
+auxiliary_loss_multiplier: 1e-5
+fused_loss: false
+
+compile: null
+
+optimizer:
+  name: adamw
+  learning_rate: 4.0e-4
+  weight_decay: 0.1
+  eps: 1e-8
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  betas:
+    - 0.9
+    - 0.95
+  metrics_log_interval: 1
+
+scheduler:
+  name: cosine_with_warmup
+  units: tokens
+  # Было под полный mix (4T+); для Wiki 3.66B старый warmup (8.39B) длиннее всего корпуса.
+  t_warmup: 100000000
+  t_max: 2000000000
+  alpha_f: 0.1
+  warmup_min_lr: 0.0
+
+tokenizer:
+  identifier: tokenizers/allenai_dolma2.json
+  truncate_direction: right
+
+save_folder: ./runs/${run_name}
+save_overwrite: false
+
+save_interval: 1000
+save_interval_ephemeral: 1000
+save_num_checkpoints_to_keep: 2
+sharded_checkpointer: olmo_core
+
+save_interval_unsharded: 1000
+save_num_unsharded_checkpoints_to_keep: -1
+
+load_path: null
+
+global_train_batch_size: 512
+device_train_microbatch_size: 2
+
+max_duration: 2000000000T
+
+precision: amp_bf16
+
+distributed_strategy: fsdp
+
+fsdp:
+  wrapping_strategy: null
+  sharding_strategy: SHARD_GRAD_OP
+  precision: mixed
+
+max_grad_norm: 1.0
+max_grad_norm_ratio: null
+
+speed_monitor:
+  window_size: 1
+
+gen1_gc_interval: 10
+
+eval_interval: 1000
+eval_subset_num_batches: -1
+device_eval_batch_size: ${device_train_microbatch_size}
+
+# Только LM по wiki-val; для полного набора eval скопируйте секцию evaluators из OLMo2-1B-stage1.yaml.
+evaluators:
+  - label: dolma-slimpajame-validation
+    type: lm
+    data:
+      pad_direction: right
+      num_workers: 4
+      drop_last: true
+      pin_memory: true
+      prefetch_factor: 2
+      persistent_workers: true
+      memmap_dtype: uint32
+      paths:
+        - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/validation/0_00000.npy
+
+data:
+  pad_direction: right
+  num_workers: 12
+  drop_last: true
+  pin_memory: true
+  prefetch_factor: 4
+  persistent_workers: true
+  memmap_dtype: uint32
+  timeout: 0
+  instance_filter:
+    repetition_max_period: 13
+    repetition_min_period: 1
+    repetition_max_count: 32
+  paths:
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00000.npy
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00001.npy
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00002.npy
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00003.npy
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00004.npy
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00005.npy
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00006.npy
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00007.npy
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00008.npy
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00009.npy
+    - /home/gur_andry/OLMo-Zero-Order-Optimization/data/slimpajame/train/0_00010.npy
