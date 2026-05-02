@@ -1,0 +1,166 @@
+# Smoke-тест ZO Divergence Probe + DDP (2 GPU).
+# AdamW делает обычный шаг с backward; каждый шаг дополнительно запускаются
+# ZO-пробы (MeZO и ZOMuon) на том же батче, и логируется косинус между
+# p.grad (истинный градиент) и направлением каждого ZO-обновления.
+#
+# Метрики в логах:
+#   zo_probe/mezo_cosine      — косинус(p.grad, MeZO-update-direction)
+#   zo_probe/mezo_scalar_abs  — |scalar| = |(f+ - f-)| / (2ε) для MeZO
+#   zo_probe/zomuon_cosine    — косинус(p.grad, ZOMuon-update-direction)
+#   zo_probe/zomuon_scalar_abs — аналогично для ZOMuon
+#
+# Накладные расходы на шаг:
+#   MeZO-проба:   2 forward-прохода  (antithetic ±ε)
+#   ZOMuon-проба: 2 forward-прохода  (antithetic ±ε · P@u)
+#   Итого +4 forward-прохода к обычному fwd+bwd AdamW.
+#   При probe_interval > 1 overhead снижается пропорционально.
+#
+# Запуск (2 GPU):
+#   uv run torchrun --nproc_per_node=2 scripts/train.py configs/smoke/OLMo2-ddp-adamw-zo-probe-smoke.yaml
+#
+# Один GPU:
+#   uv run torchrun --nproc_per_node=1 scripts/train.py configs/smoke/OLMo2-ddp-adamw-zo-probe-smoke.yaml
+#
+# global_train_batch_size=8 делится на 1, 2, 4 и 8 GPU без остатка.
+#
+# IPv6 / localhost:
+#   export MASTER_ADDR=127.0.0.1
+
+run_name: OLMo2-ddp-adamw-zo-probe-smoke
+seed: 42
+save_overwrite: true
+no_pre_train_checkpoint: true
+save_data_indices: false
+
+save_folder: ./.olmo-smoke-runs/ddp-adamw-zo-probe-smoke
+save_interval: null
+save_interval_unsharded: null
+save_num_checkpoints_to_keep: 0
+save_num_unsharded_checkpoints_to_keep: 0
+
+max_duration: 100
+stop_at: 5
+
+distributed_strategy: ddp
+
+ddp:
+  grad_sync_mode: batch
+  find_unused_params: false
+
+precision: fp32
+
+model:
+  d_model: 384
+  n_heads: 8
+  n_layers: 2
+  mlp_ratio: 4
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_theta: 500000
+  flash_attention: false
+  attention_dropout: 0.0
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1.0e-6
+  bias_for_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  norm_after: true
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 512
+  vocab_size: 100278
+  embedding_size: 100352
+  eos_token_id: 100257
+  pad_token_id: 100277
+  init_device: cuda
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+
+fused_loss: false
+softmax_auxiliary_loss: false
+
+compile: null
+
+optimizer:
+  name: adamw
+  learning_rate: 1.0e-4
+  weight_decay: 0.1
+  eps: 1.0e-8
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  betas:
+    - 0.9
+    - 0.95
+
+scheduler:
+  name: cosine_with_warmup
+  units: steps
+  t_warmup: 2
+  t_max: 100
+  alpha_f: 0.1
+  warmup_min_lr: 0.0
+
+tokenizer:
+  identifier: tokenizers/allenai_dolma2.json
+  truncate_direction: right
+
+# ZO Divergence Probe
+zo_probe:
+  enabled: true
+  zo_eps: 1.0e-3
+  mezo_enabled: true
+  zomuon_enabled: true
+  zomuon_rank: 2        # маленький ранг для smoke
+  zomuon_ns_steps: 5
+  probe_interval: 1     # каждый шаг; для больших моделей ставьте 10–50
+
+eval_interval: 1000
+eval_subset_num_batches: -1
+device_eval_batch_size: 1
+
+evaluators:
+  - label: dolma_wiki-validation
+    type: lm
+    subset_num_batches: 1
+    device_eval_batch_size: 1
+    data:
+      pad_direction: right
+      num_workers: 0
+      drop_last: true
+      pin_memory: false
+      prefetch_factor: null
+      persistent_workers: false
+      memmap_dtype: uint32
+      paths:
+        - http://olmo-data.org/eval-data/perplexity/v3_small_dolma2-tokenizer/dolma_wiki/val/part-0-00000.npy
+
+data:
+  pad_direction: right
+  num_workers: 0
+  drop_last: true
+  pin_memory: false
+  prefetch_factor: null
+  persistent_workers: false
+  memmap_dtype: uint32
+  instance_filter: null
+  paths:
+    - http://olmo-data.org/preprocessed/olmo-mix/danyh-compiled-v1_7/documents/wiki/allenai/dolma2-tokenizer/part-0-00000.npy
+
+global_train_batch_size: 8
+device_train_microbatch_size: 2
+
+max_grad_norm: 1.0
+
+speed_monitor:
+  window_size: 1
+
+gen1_gc_interval: null
+
+console_log_interval: 1
+canceled_check_interval: 1000
