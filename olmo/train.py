@@ -39,6 +39,7 @@ from .config import (
     ShardedCheckpointerType,
     SpeedMonitorConfig,
     TrainConfig,
+    ZOProbeConfig,
 )
 from .data import IterableDataset
 from .eval import Evaluator
@@ -61,6 +62,7 @@ from .torch_util import (
     synchronize_value,
 )
 from .zo_optim import ZeroOrderOptimizer
+from .zo_probe import ZODivergenceProbe
 from .util import upload
 
 __all__ = ["SpeedMonitor", "LRMonitor", "Trainer"]
@@ -244,6 +246,20 @@ class Trainer:
                 self.loss_fn = fused_loss_fn
             else:
                 raise NameError("`fused_loss_fn` is not defined. Please ensure that `flash_attn` is installed.")
+
+        probe_cfg: Optional[ZOProbeConfig] = self.cfg.zo_probe
+        if probe_cfg is not None and probe_cfg.enabled and not isinstance(self.optim, ZeroOrderOptimizer):
+            self._zo_probe: Optional[ZODivergenceProbe] = ZODivergenceProbe(
+                model=self.model,
+                zo_eps=probe_cfg.zo_eps,
+                mezo_enabled=probe_cfg.mezo_enabled,
+                zomuon_enabled=probe_cfg.zomuon_enabled,
+                zomuon_rank=probe_cfg.zomuon_rank,
+                zomuon_ns_steps=probe_cfg.zomuon_ns_steps,
+                probe_interval=probe_cfg.probe_interval,
+            )
+        else:
+            self._zo_probe = None
 
     @property
     def dataset(self) -> IterableDataset:
@@ -951,6 +967,35 @@ class Trainer:
             # HYBRID sharding.
             process_group=self.dist_model.process_group,
         )
+
+        # ZO divergence probe: measure cosine similarity between p.grad and ZO update directions.
+        # Runs after backward (p.grad available) and before optimizer.step (params still at θ_t).
+        if self._zo_probe is not None:
+            if is_distributed():
+                _probe_seed_local = int(np.random.randint(0, 1_000_000_000)) if get_global_rank() == 0 else 0
+                _probe_seed = int(synchronize_value(_probe_seed_local, self.device))
+            else:
+                _probe_seed = int(np.random.randint(0, 1_000_000_000))
+
+            _probe_micro_batches = self.split_batch(batch)
+            _probe_batch_tokens = batch["input_ids"].numel()
+
+            def _probe_loss_fn() -> torch.Tensor:
+                total = torch.zeros((), device=self.device, dtype=torch.float32)
+                _ac_dev = "mps" if self.device.type == "mps" else "cuda"
+                with torch.inference_mode():
+                    with torch.autocast(_ac_dev, enabled=True, dtype=self.cfg.autocast_precision):
+                        for _mb in _probe_micro_batches:
+                            _loss, _, _ = self.train_micro_batch(_mb, _probe_batch_tokens)
+                            total += _loss.float()
+                if is_distributed():
+                    dist.all_reduce(total, op=dist.ReduceOp.SUM)
+                    total /= get_world_size()
+                return total
+
+            _probe_metrics = self._zo_probe.maybe_compute(self.global_step, _probe_seed, _probe_loss_fn)
+            for _k, _v in _probe_metrics.items():
+                metrics[f"zo_probe/{_k}"] = _v
 
         # Adjust the learning rate.
         for group in self.optim.param_groups:
