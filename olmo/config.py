@@ -58,6 +58,7 @@ __all__ = [
     "FSDPConfig",
     "SingleGPUConfig",
     "CheckpointType",
+    "ZOProbeConfig",
 ]
 
 C = TypeVar("C", bound="BaseConfig")
@@ -766,6 +767,25 @@ class SpeedMonitorConfig(BaseConfig):
 
 
 @dataclass
+class ZOProbeConfig(BaseConfig):
+    """Configuration for the ZO divergence probe.
+
+    When attached to a ``TrainConfig``, the probe runs forward-only passes on the
+    same batch as AdamW, computes MeZO and/or ZOMuon update directions, and logs
+    their cosine similarity with ``p.grad`` (the true gradient) each ``probe_interval``
+    steps.  Only active for first-order (AdamW / LionW) training runs.
+    """
+
+    enabled: bool = True
+    zo_eps: float = 1e-3
+    mezo_enabled: bool = True
+    zomuon_enabled: bool = True
+    zomuon_rank: int = 4
+    zomuon_ns_steps: int = 5
+    probe_interval: int = 1
+
+
+@dataclass
 class CompilerConfig(BaseConfig):
     mode: Optional[str] = None
     """
@@ -1257,6 +1277,12 @@ class TrainConfig(BaseConfig):
     wandb: Optional[WandbConfig] = None
     """
     Weights & Biases configuration.
+    """
+
+    zo_probe: Optional[ZOProbeConfig] = None
+    """
+    ZO divergence probe: measures cosine similarity between AdamW gradient and MeZO/ZOMuon
+    update directions each ``probe_interval`` steps.  Only active for first-order optimizers.
     """
 
     speed_monitor: SpeedMonitorConfig = field(default_factory=SpeedMonitorConfig)
