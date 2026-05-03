@@ -1,0 +1,192 @@
+# OLMo2-1B, wiki, AdamW + ZO Divergence Probe, DDP 2 GPU.
+#
+# Каждые probe_interval шагов AdamW делает обычный fwd+bwd+step,
+# а параллельно (до step) запускаются ZO-пробы на том же батче:
+#   - MeZO:   2 forward-прохода (±ε·z)
+#   - ZOMuon: 2 forward-прохода (±ε·P@u)
+# Логируются метрики:
+#   zo_probe/mezo_cosine      — косинус(p.grad, MeZO-направление)
+#   zo_probe/mezo_scalar_abs  — |(f+−f−)/(2ε)| для MeZO
+#   zo_probe/zomuon_cosine    — косинус(p.grad, ZOMuon-направление)
+#   zo_probe/zomuon_scalar_abs — аналогично для ZOMuon
+#
+# Накладные расходы пробы (при probe_interval=10):
+#   +4 forward-прохода каждые 10 шагов ≈ +40% времени на шаги с пробой,
+#   средний overhead ≈ +4% к общему времени обучения.
+#
+# ВАЖНО: проба требует DDP (не FSDP).
+#   FSDP хранит параметры шардированными; проба напрямую пишет в p.data
+#   полных параметров — с FSDP результаты были бы некорректными.
+#
+# Память (2×A100 40GB):
+#   Model bf16:     ~2.5 GB / GPU
+#   Gradients bf16: ~2.5 GB / GPU
+#   AdamW state:    ~5.0 GB / GPU (2 момента fp32)
+#   Activации:      ~1-2 GB / GPU (batch=4, seq=1024)
+#   Итого:          ~11-12 GB / GPU — комфортно на 40 GB.
+#
+# Запуск (2 GPU):
+#   uv run torchrun --nproc_per_node=2 scripts/train.py \
+#       configs/wiki/OLMo2-1B-wiki-ddp-adamw-zo-probe.yaml
+#
+# Для 4 GPU: global_train_batch_size=512 делится без остатка.
+# Для 1 GPU: убрать distributed_strategy/ddp и поставить single.
+#
+# IPv6 / localhost:
+#   export MASTER_ADDR=127.0.0.1
+
+run_name: OLMo2-1B-wiki-ddp-adamw-zo-probe
+seed: 6198
+dry_run: false
+
+wandb:
+  name: ${run_name}
+  project: olmo-wiki
+  group: ${run_name}
+  entity: null
+
+model:
+  d_model: 2048
+  n_heads: 16
+  n_layers: 16
+  mlp_ratio: 8
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_theta: 500000
+  flash_attention: true
+  attention_dropout: 0.0
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1e-6
+  bias_for_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  norm_after: true
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 1024
+  vocab_size: 100278
+  embedding_size: 100352
+  eos_token_id: 100257
+  pad_token_id: 100277
+  init_device: cuda   # DDP требует реального размещения (не meta)
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+
+softmax_auxiliary_loss: true
+auxiliary_loss_multiplier: 1e-5
+fused_loss: false
+
+compile: null
+
+optimizer:
+  name: adamw
+  learning_rate: 4.0e-4
+  weight_decay: 0.1
+  eps: 1e-8
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  betas:
+    - 0.9
+    - 0.95
+  metrics_log_interval: 1
+
+scheduler:
+  name: cosine_with_warmup
+  units: tokens
+  t_warmup: 200000000
+  t_max: 3660000000
+  alpha_f: 0.1
+  warmup_min_lr: 0.0
+
+tokenizer:
+  identifier: tokenizers/allenai_dolma2.json
+  truncate_direction: right
+
+save_folder: ./runs/OLMo2-1B-wiki-ddp-adamw-zo-probe
+save_overwrite: false
+
+save_interval: 1000
+save_interval_ephemeral: 1000
+save_num_checkpoints_to_keep: 2
+save_interval_unsharded: 1000
+save_num_unsharded_checkpoints_to_keep: 2
+
+load_path: null
+
+global_train_batch_size: 512
+device_train_microbatch_size: 4
+
+max_duration: 3660000000T
+
+precision: amp_bf16
+
+distributed_strategy: ddp
+
+ddp:
+  grad_sync_mode: batch
+  find_unused_params: false
+
+max_grad_norm: 1.0
+max_grad_norm_ratio: null
+
+# ZO Divergence Probe
+# Запускается каждые probe_interval шагов AdamW.
+# +4 forward-прохода на шаг с пробой; при probe_interval=10 средний overhead ~4%.
+# Для более частых измерений: probe_interval: 1 (+400% overhead — только для коротких экспериментов).
+# Для экономичного режима: probe_interval: 50 (<1% overhead).
+zo_probe:
+  enabled: true
+  zo_eps: 1.0e-3       # стандартный ε, как у MeZO/ZOMuon в обучении
+  mezo_enabled: true
+  zomuon_enabled: true
+  zomuon_rank: 16      # ранг для пробы; не обязан совпадать с zo_muon_rank в обучении
+  zomuon_ns_steps: 5
+  probe_interval: 10   # измерять каждые 10 шагов
+
+speed_monitor:
+  window_size: 1
+
+gen1_gc_interval: 10
+
+eval_interval: 1000
+eval_subset_num_batches: -1
+device_eval_batch_size: ${device_train_microbatch_size}
+
+evaluators:
+  - label: dolma_wiki-validation
+    type: lm
+    data:
+      pad_direction: right
+      num_workers: 4
+      drop_last: true
+      pin_memory: true
+      prefetch_factor: 2
+      persistent_workers: true
+      memmap_dtype: uint32
+      paths:
+        - /home/gur_andry/data/wikitext/validation/0_00000.npy
+
+data:
+  pad_direction: right
+  num_workers: 8
+  drop_last: true
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  memmap_dtype: uint32
+  timeout: 0
+  instance_filter:
+    repetition_max_period: 13
+    repetition_min_period: 1
+    repetition_max_count: 32
+  paths:
+    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00000.npy
+    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00001.npy
+    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00002.npy
+    - /home/gur_andry/data/olmo-wiki/train/wiki-0000/0_00000.npy
