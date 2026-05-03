@@ -65,12 +65,14 @@ class ZODivergenceProbe:
     def _zomuon_u(self, p: torch.Tensor, seed: int, idx: int) -> torch.Tensor:
         rank = min(self.zomuon_rank, p.shape[0])
         gen = torch.Generator(device=p.device)
-        gen.manual_seed((seed + idx * 999_983) % (2**31))
+        # Salt 987_654_321 prevents seed collision with _mezo_z at idx=0
+        # (both would otherwise evaluate to `seed` when idx=0).
+        gen.manual_seed((seed + idx * 999_983 + 987_654_321) % (2**31))
         return torch.randn(rank, p.shape[1], device=p.device, dtype=torch.float32, generator=gen)
 
     def _zomuon_z1d(self, p: torch.Tensor, seed: int, idx: int) -> torch.Tensor:
         gen = torch.Generator(device=p.device)
-        gen.manual_seed((seed + idx * 111_317) % (2**31))
+        gen.manual_seed((seed + idx * 111_317 + 987_654_321) % (2**31))
         return torch.randn(p.shape, device=p.device, dtype=torch.float32, generator=gen)
 
     # ------------------------------------------------------------------
@@ -128,18 +130,26 @@ class ZODivergenceProbe:
             for idx, p in enumerate(params):
                 z = self._mezo_z(p, seed, idx)
                 p.data.add_(z.to(p.dtype), alpha=self.zo_eps)
-        loss_plus = loss_fn()
 
-        with torch.no_grad():
-            for idx, p in enumerate(params):
-                z = self._mezo_z(p, seed, idx)
-                p.data.add_(z.to(p.dtype), alpha=-2.0 * self.zo_eps)
-        loss_minus = loss_fn()
+        # _current_scale tracks params position relative to θ:
+        # +1.0 → params at θ + ε·z  (restore with -ε·z)
+        # -1.0 → params at θ - ε·z  (restore with +ε·z)
+        _current_scale = 1.0
+        try:
+            loss_plus = loss_fn()
 
-        with torch.no_grad():
-            for idx, p in enumerate(params):
-                z = self._mezo_z(p, seed, idx)
-                p.data.add_(z.to(p.dtype), alpha=self.zo_eps)  # restore
+            with torch.no_grad():
+                for idx, p in enumerate(params):
+                    z = self._mezo_z(p, seed, idx)
+                    p.data.add_(z.to(p.dtype), alpha=-2.0 * self.zo_eps)
+            _current_scale = -1.0
+
+            loss_minus = loss_fn()
+        finally:
+            with torch.no_grad():
+                for idx, p in enumerate(params):
+                    z = self._mezo_z(p, seed, idx)
+                    p.data.add_(z.to(p.dtype), alpha=-_current_scale * self.zo_eps)
 
         scalar = (loss_plus - loss_minus).item() / (2.0 * self.zo_eps)
 
@@ -192,17 +202,20 @@ class ZODivergenceProbe:
                 pert_dirs.append(delta)
                 p.data.add_(delta.to(p.dtype), alpha=self.zo_eps)
 
-        loss_plus = loss_fn()
+        _current_scale = 1.0
+        try:
+            loss_plus = loss_fn()
 
-        with torch.no_grad():
-            for p, delta in zip(params, pert_dirs):
-                p.data.add_(delta.to(p.dtype), alpha=-2.0 * self.zo_eps)
+            with torch.no_grad():
+                for p, delta in zip(params, pert_dirs):
+                    p.data.add_(delta.to(p.dtype), alpha=-2.0 * self.zo_eps)
+            _current_scale = -1.0
 
-        loss_minus = loss_fn()
-
-        with torch.no_grad():
-            for p, delta in zip(params, pert_dirs):
-                p.data.add_(delta.to(p.dtype), alpha=self.zo_eps)  # restore
+            loss_minus = loss_fn()
+        finally:
+            with torch.no_grad():
+                for p, delta in zip(params, pert_dirs):
+                    p.data.add_(delta.to(p.dtype), alpha=-_current_scale * self.zo_eps)
 
         scalar = (loss_plus - loss_minus).item() / (2.0 * self.zo_eps)
 
