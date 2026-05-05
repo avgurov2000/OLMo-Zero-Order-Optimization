@@ -29,6 +29,7 @@ dependencies = [
     "datasets>=4.8.4",
     "torchmetrics",
     "scikit-learn",
+    "pytest>=9.0.2",
 ]
 
 [project.optional-dependencies]
