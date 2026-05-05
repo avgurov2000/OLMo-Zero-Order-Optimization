@@ -25,6 +25,10 @@ dependencies = [
     "cached_path>=1.6.2",
     "transformers",
     "importlib_resources",
+    "wandb>=0.25.1",
+    "datasets>=4.8.4",
+    "torchmetrics",
+    "scikit-learn",
 ]
 
 [project.optional-dependencies]
@@ -44,11 +48,9 @@ train = [
     "wandb",
     "beaker-gantry",
     "click",
-    "torchmetrics",
     "smashed[remote]>=0.21.1",
     "safetensors",
     "datasets",
-    "scikit-learn",
     "msgspec>=0.14.0",
 ]
 all = [
