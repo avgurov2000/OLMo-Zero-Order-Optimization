@@ -576,6 +576,16 @@ class OptimizerConfig(BaseConfig):
     mezo_vector_sampling_type: str = "standard_normal"
     """MeZO / ZoAdam / LDSD: ``standard_normal`` or ``lp_sphere`` for the probing direction ``z``."""
 
+    mezo_num_pert_samples: int = 1
+    """MeZO: number of antithetic perturbation pairs per step.
+    1 → single pair (2 forward passes).
+    N > 1 → N independent pairs (2N forward passes), lower-variance gradient estimate."""
+
+    lozo_num_pert_samples: int = 1
+    """LOZO: number of antithetic perturbation pairs per step.
+    1 → single pair (2 forward passes).
+    N > 1 → N pairs with shared V (2N forward passes), lower-variance estimate."""
+
     ldsd_muon_newtonschulz_steps: int = 5
     """LDSDMuon: number of Newton-Schulz iterations for orthogonalising the 2-D gradient estimate."""
 

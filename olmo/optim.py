@@ -1007,6 +1007,7 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             weight_decay=cfg.optimizer.weight_decay,
             momentum=cfg.optimizer.mezo_momentum,
             vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
+            num_pert_samples=cfg.optimizer.mezo_num_pert_samples,
         )
     elif cfg.optimizer.name == OptimizerType.lozo:
         from .zo_optim import LOZO
@@ -1023,6 +1024,7 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             step_interval=cfg.optimizer.lozo_step_interval,
             perturbation_mode=cfg.optimizer.zo_perturbation_mode,
             weight_decay=cfg.optimizer.weight_decay,
+            num_pert_samples=cfg.optimizer.lozo_num_pert_samples,
         )
     elif cfg.optimizer.name == OptimizerType.zo_adam:
         from .zo_optim import ZoAdam
@@ -1037,6 +1039,7 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             perturbation_mode=cfg.optimizer.zo_perturbation_mode,
             weight_decay=cfg.optimizer.weight_decay,
             vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
+            num_pert_samples=cfg.optimizer.mezo_num_pert_samples,
         )
     elif cfg.optimizer.name == OptimizerType.zo_muon:
         from .zo_optim import ZOMuon
