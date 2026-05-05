@@ -107,6 +107,12 @@ class MeZO(ZeroOrderOptimizer):
             ``z * projected_grad / ε`` concatenated across all parameters
             (before lr scaling and weight decay).  Comparable to a gradient
             norm in first-order training.
+        grad_est_norm_per_z_rms
+            ``grad_est_norm`` divided by the RMS norm of the raw probe
+            directions ``z`` (same samples as in the estimate).  For MeZO this
+            equals ``|projected_grad| / ε`` and removes the ``√(num_params)``
+            scale from ``||z||₂``.  Not the norm of a direction-normalized
+            ``ĝ`` (that would be trivially 1).
         """
         return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
 
@@ -146,6 +152,7 @@ class MeZO(ZeroOrderOptimizer):
     def _apply_update(self, z_seed: int, projected_grad: float) -> None:
         self._reset_generators(z_seed)
         grad_sum_sq = 0.0
+        z_sum_sq = 0.0
         for group in self.param_groups:
             lr = group["lr"]
             eps = group["zo_eps"]
@@ -156,6 +163,7 @@ class MeZO(ZeroOrderOptimizer):
                     continue
                 gen = self._get_generator(p.device)
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
+                z_sum_sq += z.to(torch.float32).norm().item() ** 2
                 grad_est = z.mul_(projected_grad / eps)
                 # Accumulate before weight decay to track pure SPSA estimate norm.
                 grad_sum_sq += grad_est.to(torch.float32).norm().item() ** 2
@@ -170,7 +178,10 @@ class MeZO(ZeroOrderOptimizer):
                         buf.mul_(momentum).add_(grad_est)
                         grad_est = buf
                 p.data.add_(grad_est, alpha=-lr)
-        self._last_metrics["grad_est_norm"] = math.sqrt(grad_sum_sq)
+        ge = math.sqrt(grad_sum_sq)
+        z_rms = math.sqrt(z_sum_sq) if z_sum_sq > 0.0 else 0.0
+        self._last_metrics["grad_est_norm"] = ge
+        self._last_metrics["grad_est_norm_per_z_rms"] = (ge / z_rms) if z_rms > 0.0 else float("nan")
 
 
 class ZoAdam(ZeroOrderOptimizer):
@@ -243,6 +254,10 @@ class ZoAdam(ZeroOrderOptimizer):
         update_norm
             Global L2 norm of the actual Adam-preconditioned update applied
             to the parameters.  Reflects the effect of moment scaling.
+        grad_est_norm_per_z_rms
+            ``grad_est_norm`` divided by the RMS norm of the raw ``z`` probes
+            (same as in MeZO).  Equals ``|projected_grad| / ε`` for the SPSA
+            block before Adam.
         """
         return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
 
@@ -282,6 +297,7 @@ class ZoAdam(ZeroOrderOptimizer):
     def _apply_update(self, z_seed: int, projected_grad: float) -> None:
         self._reset_generators(z_seed)
         grad_sum_sq = 0.0
+        z_sum_sq = 0.0
         update_sum_sq = 0.0
         for group in self.param_groups:
             lr = group["lr"]
@@ -299,6 +315,7 @@ class ZoAdam(ZeroOrderOptimizer):
 
                 gen = self._get_generator(p.device)
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
+                z_sum_sq += z.to(dtype=torch.float32).norm().item() ** 2
                 g = z.mul(projected_grad / zo_eps)
 
                 g32 = g.to(dtype=torch.float32)
@@ -327,7 +344,10 @@ class ZoAdam(ZeroOrderOptimizer):
                 update_sum_sq += update.to(torch.float32).norm().item() ** 2
                 p.data.add_(update)
 
-        self._last_metrics["grad_est_norm"] = math.sqrt(grad_sum_sq)
+        ge = math.sqrt(grad_sum_sq)
+        z_rms = math.sqrt(z_sum_sq) if z_sum_sq > 0.0 else 0.0
+        self._last_metrics["grad_est_norm"] = ge
+        self._last_metrics["grad_est_norm_per_z_rms"] = (ge / z_rms) if z_rms > 0.0 else float("nan")
         self._last_metrics["update_norm"] = math.sqrt(update_sum_sq)
 
 
@@ -375,6 +395,11 @@ class LOZO(ZeroOrderOptimizer):
             across all parameters (before lr scaling).  For 2D params the
             Frobenius norm of ``U @ V.T`` is computed efficiently via the
             ``rank × rank`` Gram matrices; for 1D params the standard L2 norm.
+        grad_est_norm_per_z_rms
+            ``grad_est_norm`` divided by the RMS norm of the probe directions
+            (``U @ V.T`` Frobenius contribution per 2-D param, ``z`` L2 per 1-D
+            param).  For this optimizer equals ``|projected_grad|`` from
+            ``step()`` (the scalar already includes the ``1/ε`` factor).
         """
         return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
 
@@ -442,6 +467,7 @@ class LOZO(ZeroOrderOptimizer):
 
     def _apply_update(self, z_seed: int, projected_grad: float) -> None:
         grad_sum_sq = 0.0
+        z_sum_sq = 0.0
         for group, p, idx in self._flat_params():
             if not p.requires_grad:
                 continue
@@ -454,17 +480,22 @@ class LOZO(ZeroOrderOptimizer):
                 # Computed via two (rank x rank) Gram matrices — no full m×n materialisation.
                 ugu = u.to(torch.float32).T @ u.to(torch.float32)  # (rank, rank)
                 vgv = v.to(torch.float32).T @ v.to(torch.float32)  # (rank, rank)
+                z_sum_sq += (ugu @ vgv).trace().item()
                 grad_sum_sq += projected_grad ** 2 * (ugu @ vgv).trace().item()
                 p.data.addmm_(u, v.t(), alpha=-lr * projected_grad)
                 if weight_decay != 0.0:
                     p.data.mul_(1.0 - lr * weight_decay)
             else:
                 z = self._get_z1d(p, z_seed, idx)
+                z_sum_sq += z.to(torch.float32).norm().item() ** 2
                 grad_sum_sq += (projected_grad * z.to(torch.float32)).norm().item() ** 2
                 p.data.add_(z, alpha=-lr * projected_grad)
                 if weight_decay != 0.0:
                     p.data.mul_(1.0 - lr * weight_decay)
-        self._last_metrics["grad_est_norm"] = math.sqrt(max(grad_sum_sq, 0.0))
+        ge = math.sqrt(max(grad_sum_sq, 0.0))
+        z_rms = math.sqrt(z_sum_sq) if z_sum_sq > 0.0 else 0.0
+        self._last_metrics["grad_est_norm"] = ge
+        self._last_metrics["grad_est_norm_per_z_rms"] = (ge / z_rms) if z_rms > 0.0 else float("nan")
 
 
 # ---------------------------------------------------------------------------

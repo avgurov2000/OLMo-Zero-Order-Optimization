@@ -135,6 +135,9 @@ class LDSDMuon(ZeroOrderOptimizer):
         grad_est_norm
             L2 norm of ``g * z_fresh / ε`` concatenated across all params
             (raw estimate before Newton-Schulz/sign, before lr scaling).
+        grad_est_norm_per_z_rms
+            ``grad_est_norm`` over the RMS norm of raw ``z``; equals ``|g|/ε``
+            with ``g = (f⁺−f⁻)/2`` from the step (same scaling as MeZO).
         """
         return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
 
@@ -187,6 +190,7 @@ class LDSDMuon(ZeroOrderOptimizer):
         from z_seed (re-shaped to its own dimensions).
         """
         grad_sum_sq = 0.0
+        z_sum_sq = 0.0
         for group in self.param_groups:
             lr = group["lr"]
             eps = group["zo_eps"]
@@ -199,6 +203,7 @@ class LDSDMuon(ZeroOrderOptimizer):
                 gen.manual_seed(z_seed)
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
 
+                z_sum_sq += z.to(torch.float32).norm().item() ** 2
                 grad_update = z.mul(projected_grad / eps)
                 grad_sum_sq += grad_update.to(torch.float32).norm().item() ** 2
 
@@ -213,7 +218,10 @@ class LDSDMuon(ZeroOrderOptimizer):
                     p.data.mul_(1.0 - lr * weight_decay)
                 p.data.add_(grad_final, alpha=-lr)
 
-        self._last_metrics["grad_est_norm"] = math.sqrt(grad_sum_sq)
+        ge = math.sqrt(grad_sum_sq)
+        z_rms = math.sqrt(z_sum_sq) if z_sum_sq > 0.0 else 0.0
+        self._last_metrics["grad_est_norm"] = ge
+        self._last_metrics["grad_est_norm_per_z_rms"] = (ge / z_rms) if z_rms > 0.0 else float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +293,10 @@ class LDSDSignSgd(ZeroOrderOptimizer):
             |g| where g = (f+ − f−)/2  (raw, before sign compression).
         grad_est_norm
             L2 norm of ``sign(g) * z / ε`` across all params.
+        grad_est_norm_per_z_rms
+            Ratio to RMS ``||z||₂``; with ``|sign(g)|=1`` equals ``1/ε``; scales
+            with ``|g|`` if you compare to raw ``g`` via ``projected_grad_abs/ε``
+            only when the sign is non-degenerate.
         """
         return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
 
@@ -333,6 +345,7 @@ class LDSDSignSgd(ZeroOrderOptimizer):
     def _apply_update(self, z_seed: int, signed_grad: float) -> None:
         self._reset_generators(z_seed)
         grad_sum_sq = 0.0
+        z_sum_sq = 0.0
         for group in self.param_groups:
             lr = group["lr"]
             eps = group["zo_eps"]
@@ -343,6 +356,7 @@ class LDSDSignSgd(ZeroOrderOptimizer):
                     continue
                 gen = self._get_generator(p.device)
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
+                z_sum_sq += z.to(torch.float32).norm().item() ** 2
                 grad_est = z.mul(signed_grad / eps)
                 grad_sum_sq += grad_est.to(torch.float32).norm().item() ** 2
                 if weight_decay != 0.0:
@@ -356,7 +370,10 @@ class LDSDSignSgd(ZeroOrderOptimizer):
                         buf.mul_(momentum).add_(grad_est)
                         grad_est = buf
                 p.data.add_(grad_est, alpha=-lr)
-        self._last_metrics["grad_est_norm"] = math.sqrt(grad_sum_sq)
+        ge = math.sqrt(grad_sum_sq)
+        z_rms = math.sqrt(z_sum_sq) if z_sum_sq > 0.0 else 0.0
+        self._last_metrics["grad_est_norm"] = ge
+        self._last_metrics["grad_est_norm_per_z_rms"] = (ge / z_rms) if z_rms > 0.0 else float("nan")
 
 
 # ---------------------------------------------------------------------------
