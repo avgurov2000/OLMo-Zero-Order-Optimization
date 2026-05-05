@@ -51,6 +51,7 @@ class MeZO(ZeroOrderOptimizer):
         weight_decay: float = 0.0,
         momentum: float = 0.0,
         vector_sampling_type: str = "standard_normal",
+        num_pert_samples: int = 1,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -58,6 +59,8 @@ class MeZO(ZeroOrderOptimizer):
             raise ValueError(f"Invalid zo_eps: {zo_eps}")
         if perturbation_mode not in ("two_side", "one_side"):
             raise ValueError("perturbation_mode must be 'two_side' or 'one_side'")
+        if num_pert_samples < 1:
+            raise ValueError(f"Invalid num_pert_samples: {num_pert_samples}")
 
         defaults = dict(
             lr=lr,
@@ -65,6 +68,7 @@ class MeZO(ZeroOrderOptimizer):
             perturbation_mode=perturbation_mode,
             weight_decay=weight_decay,
             momentum=momentum,
+            num_pert_samples=num_pert_samples,
         )
         super().__init__(params, defaults)
         self.vector_sampler = VectorSampler(vector_sampling_type)
@@ -115,22 +119,32 @@ class MeZO(ZeroOrderOptimizer):
         if z_seed is None:
             z_seed = int(np.random.randint(0, 1_000_000_000))
 
-        self._perturb(z_seed, scaling_factor=+1.0)
-        loss_plus = closure()
+        num_pert = self.defaults["num_pert_samples"]
+        samples: list[tuple[int, float]] = []
+        first_loss: Optional[torch.Tensor] = None
 
-        if self.defaults["perturbation_mode"] == "two_side":
-            self._perturb(z_seed, scaling_factor=-2.0)
-            loss_minus = closure()
-            projected_grad = (loss_plus - loss_minus).item() / 2.0
-            self._perturb(z_seed, scaling_factor=+1.0)
-        else:
-            self._perturb(z_seed, scaling_factor=-1.0)
-            loss_minus = closure()
-            projected_grad = (loss_plus - loss_minus).item()
+        for i in range(num_pert):
+            seed_i = (z_seed + i * 987_654_321) % (2**31)
+            self._perturb(seed_i, scaling_factor=+1.0)
+            loss_plus = closure()
+            if first_loss is None:
+                first_loss = loss_plus
 
-        self._apply_update(z_seed, projected_grad)
-        self._last_metrics["projected_grad_abs"] = abs(projected_grad)
-        return loss_plus
+            if self.defaults["perturbation_mode"] == "two_side":
+                self._perturb(seed_i, scaling_factor=-2.0)
+                loss_minus = closure()
+                scalar = (loss_plus - loss_minus).item() / 2.0
+                self._perturb(seed_i, scaling_factor=+1.0)
+            else:
+                self._perturb(seed_i, scaling_factor=-1.0)
+                loss_minus = closure()
+                scalar = (loss_plus - loss_minus).item()
+
+            samples.append((seed_i, scalar))
+
+        self._apply_update(samples)
+        self._last_metrics["projected_grad_abs"] = sum(abs(s) for _, s in samples) / num_pert
+        return first_loss  # type: ignore[return-value]
 
     def _perturb(self, z_seed: int, scaling_factor: float) -> None:
         self._reset_generators(z_seed)
@@ -143,24 +157,40 @@ class MeZO(ZeroOrderOptimizer):
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
                 p.data.add_(z, alpha=scaling_factor * eps)
 
-    def _apply_update(self, z_seed: int, projected_grad: float) -> None:
-        self._reset_generators(z_seed)
+    def _apply_update(self, samples: list[tuple[int, float]]) -> None:
+        n = len(samples)
+
+        # Float32 accumulators: sum_i scalar_i * z_i / eps, averaged over n.
+        accumulators: dict[int, torch.Tensor] = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    accumulators[id(p)] = torch.zeros_like(p, dtype=torch.float32)
+
+        for seed_i, scalar_i in samples:
+            self._reset_generators(seed_i)
+            for group in self.param_groups:
+                eps = group["zo_eps"]
+                for p in group["params"]:
+                    if not p.requires_grad:
+                        continue
+                    gen = self._get_generator(p.device)
+                    z = self.vector_sampler.sample(p.shape, p.device, gen)
+                    accumulators[id(p)].add_(z.float(), alpha=scalar_i / eps)
+
         grad_sum_sq = 0.0
         for group in self.param_groups:
             lr = group["lr"]
-            eps = group["zo_eps"]
             weight_decay = group["weight_decay"]
             momentum = group["momentum"]
             for p in group["params"]:
                 if not p.requires_grad:
                     continue
-                gen = self._get_generator(p.device)
-                z = self.vector_sampler.sample(p.shape, p.device, gen)
-                grad_est = z.mul_(projected_grad / eps)
-                # Accumulate before weight decay to track pure SPSA estimate norm.
-                grad_sum_sq += grad_est.to(torch.float32).norm().item() ** 2
+                grad_est = accumulators[id(p)].div_(n)
+                # Track pure SPSA estimate norm before weight decay.
+                grad_sum_sq += grad_est.norm().item() ** 2
                 if weight_decay != 0.0:
-                    grad_est.add_(p.data, alpha=weight_decay)
+                    grad_est.add_(p.data.float(), alpha=weight_decay)
                 if momentum != 0.0:
                     state = self.state[p]
                     if "momentum_buffer" not in state:
@@ -169,7 +199,7 @@ class MeZO(ZeroOrderOptimizer):
                         buf = state["momentum_buffer"]
                         buf.mul_(momentum).add_(grad_est)
                         grad_est = buf
-                p.data.add_(grad_est, alpha=-lr)
+                p.data.add_(grad_est.to(p.dtype), alpha=-lr)
         self._last_metrics["grad_est_norm"] = math.sqrt(grad_sum_sq)
 
 
@@ -189,6 +219,7 @@ class ZoAdam(ZeroOrderOptimizer):
         perturbation_mode: str = "two_side",
         weight_decay: float = 0.0,
         vector_sampling_type: str = "standard_normal",
+        num_pert_samples: int = 1,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -199,6 +230,8 @@ class ZoAdam(ZeroOrderOptimizer):
         b1, b2 = betas
         if not (0.0 <= b1 <= 1.0 and 0.0 <= b2 <= 1.0):
             raise ValueError(f"betas must be in [0, 1], got {betas}")
+        if num_pert_samples < 1:
+            raise ValueError(f"Invalid num_pert_samples: {num_pert_samples}")
 
         defaults = dict(
             lr=lr,
@@ -207,6 +240,7 @@ class ZoAdam(ZeroOrderOptimizer):
             eps=eps,
             perturbation_mode=perturbation_mode,
             weight_decay=weight_decay,
+            num_pert_samples=num_pert_samples,
         )
         super().__init__(params, defaults)
         self.vector_sampler = VectorSampler(vector_sampling_type)
@@ -251,22 +285,32 @@ class ZoAdam(ZeroOrderOptimizer):
         if z_seed is None:
             z_seed = int(np.random.randint(0, 1_000_000_000))
 
-        self._perturb(z_seed, scaling_factor=+1.0)
-        loss_plus = closure()
+        num_pert = self.defaults["num_pert_samples"]
+        samples: list[tuple[int, float]] = []
+        first_loss: Optional[torch.Tensor] = None
 
-        if self.defaults["perturbation_mode"] == "two_side":
-            self._perturb(z_seed, scaling_factor=-2.0)
-            loss_minus = closure()
-            projected_grad = (loss_plus - loss_minus).item() / 2.0
-            self._perturb(z_seed, scaling_factor=+1.0)
-        else:
-            self._perturb(z_seed, scaling_factor=-1.0)
-            loss_minus = closure()
-            projected_grad = (loss_plus - loss_minus).item()
+        for i in range(num_pert):
+            seed_i = (z_seed + i * 987_654_321) % (2**31)
+            self._perturb(seed_i, scaling_factor=+1.0)
+            loss_plus = closure()
+            if first_loss is None:
+                first_loss = loss_plus
 
-        self._apply_update(z_seed, projected_grad)
-        self._last_metrics["projected_grad_abs"] = abs(projected_grad)
-        return loss_plus
+            if self.defaults["perturbation_mode"] == "two_side":
+                self._perturb(seed_i, scaling_factor=-2.0)
+                loss_minus = closure()
+                scalar = (loss_plus - loss_minus).item() / 2.0
+                self._perturb(seed_i, scaling_factor=+1.0)
+            else:
+                self._perturb(seed_i, scaling_factor=-1.0)
+                loss_minus = closure()
+                scalar = (loss_plus - loss_minus).item()
+
+            samples.append((seed_i, scalar))
+
+        self._apply_update(samples)
+        self._last_metrics["projected_grad_abs"] = sum(abs(s) for _, s in samples) / num_pert
+        return first_loss  # type: ignore[return-value]
 
     def _perturb(self, z_seed: int, scaling_factor: float) -> None:
         self._reset_generators(z_seed)
@@ -279,13 +323,31 @@ class ZoAdam(ZeroOrderOptimizer):
                 z = self.vector_sampler.sample(p.shape, p.device, gen)
                 p.data.add_(z, alpha=scaling_factor * zo_eps)
 
-    def _apply_update(self, z_seed: int, projected_grad: float) -> None:
-        self._reset_generators(z_seed)
+    def _apply_update(self, samples: list[tuple[int, float]]) -> None:
+        n = len(samples)
+
+        # Float32 accumulators: (1/n) * sum_i scalar_i * z_i / eps
+        accumulators: dict[int, torch.Tensor] = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    accumulators[id(p)] = torch.zeros_like(p, dtype=torch.float32)
+
+        for seed_i, scalar_i in samples:
+            self._reset_generators(seed_i)
+            for group in self.param_groups:
+                zo_eps = group["zo_eps"]
+                for p in group["params"]:
+                    if not p.requires_grad:
+                        continue
+                    gen = self._get_generator(p.device)
+                    z = self.vector_sampler.sample(p.shape, p.device, gen)
+                    accumulators[id(p)].add_(z.float(), alpha=scalar_i / zo_eps)
+
         grad_sum_sq = 0.0
         update_sum_sq = 0.0
         for group in self.param_groups:
             lr = group["lr"]
-            zo_eps = group["zo_eps"]
             weight_decay = group["weight_decay"]
             beta1, beta2 = group["betas"]
             adam_eps = group["eps"]
@@ -297,12 +359,7 @@ class ZoAdam(ZeroOrderOptimizer):
                 if weight_decay != 0.0:
                     p.data.mul_(1.0 - lr * weight_decay)
 
-                gen = self._get_generator(p.device)
-                z = self.vector_sampler.sample(p.shape, p.device, gen)
-                g = z.mul(projected_grad / zo_eps)
-
-                g32 = g.to(dtype=torch.float32)
-                # Track raw SPSA estimate norm before moment updates.
+                g32 = accumulators[id(p)].div_(n)
                 grad_sum_sq += g32.norm().item() ** 2
 
                 state = self.state[p]
@@ -341,6 +398,7 @@ class LOZO(ZeroOrderOptimizer):
         step_interval: int = 1,
         perturbation_mode: str = "two_side",
         weight_decay: float = 0.0,
+        num_pert_samples: int = 1,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -350,6 +408,8 @@ class LOZO(ZeroOrderOptimizer):
             raise ValueError(f"Invalid rank: {rank}")
         if perturbation_mode not in ("two_side", "one_side"):
             raise ValueError("perturbation_mode must be 'two_side' or 'one_side'")
+        if num_pert_samples < 1:
+            raise ValueError(f"Invalid num_pert_samples: {num_pert_samples}")
 
         defaults = dict(
             lr=lr,
@@ -358,6 +418,7 @@ class LOZO(ZeroOrderOptimizer):
             step_interval=step_interval,
             perturbation_mode=perturbation_mode,
             weight_decay=weight_decay,
+            num_pert_samples=num_pert_samples,
         )
         super().__init__(params, defaults)
         self._step_count = 0
@@ -382,25 +443,37 @@ class LOZO(ZeroOrderOptimizer):
     def step(self, closure: Callable[[], torch.Tensor], z_seed: Optional[int] = None) -> torch.Tensor:
         if z_seed is None:
             z_seed = int(np.random.randint(0, 1_000_000_000))
-        refresh_v = self._step_count % self.defaults["step_interval"] == 0
 
-        self._perturb(z_seed, scaling_factor=+1.0, refresh_v=refresh_v)
-        loss_plus = closure()
+        num_pert = self.defaults["num_pert_samples"]
+        samples: list[tuple[int, float]] = []
+        first_loss: Optional[torch.Tensor] = None
 
-        if self.defaults["perturbation_mode"] == "two_side":
-            self._perturb(z_seed, scaling_factor=-2.0, refresh_v=False)
-            loss_minus = closure()
-            projected_grad = (loss_plus - loss_minus).item() / (2.0 * self.defaults["zo_eps"])
-            self._perturb(z_seed, scaling_factor=+1.0, refresh_v=False)
-        else:
-            self._perturb(z_seed, scaling_factor=-1.0, refresh_v=False)
-            loss_minus = closure()
-            projected_grad = (loss_plus - loss_minus).item() / self.defaults["zo_eps"]
+        for i in range(num_pert):
+            seed_i = (z_seed + i * 987_654_321) % (2**31)
+            # V is refreshed only on the first sample of a refresh step.
+            refresh_v = (i == 0) and (self._step_count % self.defaults["step_interval"] == 0)
 
-        self._apply_update(z_seed, projected_grad)
-        self._last_metrics["projected_grad_abs"] = abs(projected_grad)
+            self._perturb(seed_i, scaling_factor=+1.0, refresh_v=refresh_v)
+            loss_plus = closure()
+            if first_loss is None:
+                first_loss = loss_plus
+
+            if self.defaults["perturbation_mode"] == "two_side":
+                self._perturb(seed_i, scaling_factor=-2.0, refresh_v=False)
+                loss_minus = closure()
+                projected_grad = (loss_plus - loss_minus).item() / (2.0 * self.defaults["zo_eps"])
+                self._perturb(seed_i, scaling_factor=+1.0, refresh_v=False)
+            else:
+                self._perturb(seed_i, scaling_factor=-1.0, refresh_v=False)
+                loss_minus = closure()
+                projected_grad = (loss_plus - loss_minus).item() / self.defaults["zo_eps"]
+
+            samples.append((seed_i, projected_grad))
+
+        self._apply_update(samples)
+        self._last_metrics["projected_grad_abs"] = sum(abs(s) for _, s in samples) / num_pert
         self._step_count += 1
-        return loss_plus
+        return first_loss  # type: ignore[return-value]
 
     def _flat_params(self):
         idx = 0
@@ -440,28 +513,43 @@ class LOZO(ZeroOrderOptimizer):
                 z = self._get_z1d(p, z_seed, idx)
                 p.data.add_(z, alpha=scaling_factor * eps)
 
-    def _apply_update(self, z_seed: int, projected_grad: float) -> None:
+    def _apply_update(self, samples: list[tuple[int, float]]) -> None:
+        n = len(samples)
         grad_sum_sq = 0.0
+
         for group, p, idx in self._flat_params():
             if not p.requires_grad:
                 continue
             lr = group["lr"]
             weight_decay = group["weight_decay"]
+
             if p.dim() == 2:
-                v = self.state[p]["v"]
-                u = self._get_u(p, z_seed, idx)
-                # ||projected_grad * U @ V.T||_F^2 = projected_grad^2 * tr(U.T@U @ V.T@V)
-                # Computed via two (rank x rank) Gram matrices — no full m×n materialisation.
-                ugu = u.to(torch.float32).T @ u.to(torch.float32)  # (rank, rank)
-                vgv = v.to(torch.float32).T @ v.to(torch.float32)  # (rank, rank)
-                grad_sum_sq += projected_grad ** 2 * (ugu @ vgv).trace().item()
-                p.data.addmm_(u, v.t(), alpha=-lr * projected_grad)
+                v = self.state[p]["v"]  # (n_cols, rank), p.dtype
+                effective_rank = v.shape[1]
+
+                # u_acc = (1/n) * sum_i projected_grad_i * U_i  shape (m, rank) float32
+                u_acc = torch.zeros(p.shape[0], effective_rank, device=p.device, dtype=torch.float32)
+                for seed_i, pg in samples:
+                    u_acc.add_(self._get_u(p, seed_i, idx).float(), alpha=pg)
+                u_acc.div_(n)
+
+                # ||u_acc @ V.T||_F^2 via Gram matrices — no full m×n materialisation.
+                ugu = u_acc.T @ u_acc  # (rank, rank)
+                vgv = v.float().T @ v.float()  # (rank, rank)
+                grad_sum_sq += (ugu @ vgv).trace().item()
+
+                p.data.addmm_(u_acc.to(p.dtype), v.t(), alpha=-lr)
                 if weight_decay != 0.0:
                     p.data.mul_(1.0 - lr * weight_decay)
             else:
-                z = self._get_z1d(p, z_seed, idx)
-                grad_sum_sq += (projected_grad * z.to(torch.float32)).norm().item() ** 2
-                p.data.add_(z, alpha=-lr * projected_grad)
+                # z_acc = (1/n) * sum_i projected_grad_i * z_i  float32
+                z_acc = torch.zeros(p.shape, device=p.device, dtype=torch.float32)
+                for seed_i, pg in samples:
+                    z_acc.add_(self._get_z1d(p, seed_i, idx).float(), alpha=pg)
+                z_acc.div_(n)
+
+                grad_sum_sq += z_acc.norm().item() ** 2
+                p.data.add_(z_acc.to(p.dtype), alpha=-lr)
                 if weight_decay != 0.0:
                     p.data.mul_(1.0 - lr * weight_decay)
         self._last_metrics["grad_est_norm"] = math.sqrt(max(grad_sum_sq, 0.0))
