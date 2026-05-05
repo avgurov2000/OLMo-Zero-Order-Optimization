@@ -19,18 +19,18 @@ def _param(vals):
     return torch.nn.Parameter(torch.tensor(vals, dtype=torch.float32))
 
 
-def _mezo_z(seed: int, shape: torch.Size) -> torch.Tensor:
-    """Replicate the z vector MeZO draws for a single CPU param with generator seeded to `seed`."""
-    gen = torch.Generator()
+def _mezo_z(seed: int, shape: torch.Size, *, device: torch.device) -> torch.Tensor:
+    """Match VectorSampler / MeZO: torch.normal on a device-bound Generator."""
+    gen = torch.Generator(device=device)
     gen.manual_seed(seed)
-    return torch.normal(0.0, 1.0, size=shape, generator=gen)
+    return torch.normal(0.0, 1.0, size=shape, device=device, dtype=torch.float32, generator=gen)
 
 
-def _lozo_z1d(seed: int, shape: torch.Size, param_idx: int = 0) -> torch.Tensor:
-    """Replicate LOZO's _get_z1d for a 1-D CPU param."""
-    gen = torch.Generator()
+def _lozo_z1d(p: torch.nn.Parameter, seed: int, param_idx: int = 0) -> torch.Tensor:
+    """Match LOZO._get_z1d (device + dtype + Generator)."""
+    gen = torch.Generator(device=p.device)
     gen.manual_seed((seed + param_idx * 999_983) % (2**31))
-    return torch.randn(shape, generator=gen)
+    return torch.randn(p.shape, device=p.device, dtype=p.dtype, generator=gen)
 
 
 def _sample_seeds(z_seed: int, n: int):
@@ -85,7 +85,7 @@ def test_mezo_weights_restored(n):
 
     seeds = _sample_seeds(z_seed, n)
     for i, seed_i in enumerate(seeds):
-        z_i = _mezo_z(seed_i, p.shape)
+        z_i = _mezo_z(seed_i, p.shape, device=p.device)
         # f+_i: θ + ε*z_i (independent of previous samples)
         torch.testing.assert_close(
             snapshots[2 * i], theta + zo_eps * z_i, atol=1e-6, rtol=0,
@@ -119,7 +119,7 @@ def test_zo_adam_weights_restored(n):
 
     seeds = _sample_seeds(z_seed, n)
     for i, seed_i in enumerate(seeds):
-        z_i = _mezo_z(seed_i, p.shape)
+        z_i = _mezo_z(seed_i, p.shape, device=p.device)
         torch.testing.assert_close(
             snapshots[2 * i], theta + zo_eps * z_i, atol=1e-6, rtol=0,
             msg=f"ZoAdam sample {i} f+: accumulated perturbation detected"
@@ -150,7 +150,7 @@ def test_lozo_weights_restored_1d(n):
 
     seeds = _sample_seeds(z_seed, n)
     for i, seed_i in enumerate(seeds):
-        z_i = _lozo_z1d(seed_i, p.shape, param_idx=0).to(p.dtype)
+        z_i = _lozo_z1d(p, seed_i, param_idx=0)
         torch.testing.assert_close(
             snapshots[2 * i], theta + zo_eps * z_i, atol=1e-5, rtol=0,
             msg=f"LOZO 1D sample {i} f+: accumulated perturbation"
@@ -179,18 +179,20 @@ def test_mezo_gradient_average(n):
     a = torch.tensor([0.5, -0.3, 0.8, 1.2])
     p = _param([1.0, 2.0, -1.0, 0.5])
     theta = p.data.clone()
+    a = a.to(device=p.device, dtype=p.dtype)
 
     opt = MeZO([p], lr=lr, zo_eps=zo_eps, num_pert_samples=n, weight_decay=0.0, momentum=0.0)
     opt.step(lambda: (a * p).sum(), z_seed=z_seed)
 
     expected_g = torch.zeros_like(theta)
     for seed_i in _sample_seeds(z_seed, n):
-        z_i = _mezo_z(seed_i, p.shape)
+        z_i = _mezo_z(seed_i, p.shape, device=p.device)
         scalar_i = zo_eps * (a * z_i).sum().item()   # ε·<a, zᵢ>
         expected_g += z_i * (scalar_i / zo_eps)       # <a, zᵢ>·zᵢ
     expected_g /= n
 
-    torch.testing.assert_close(p.data, theta - lr * expected_g, atol=1e-5, rtol=0)
+    # Averaging n float32 probe directions accumulates rounding; relax atol vs strict rtol=0.
+    torch.testing.assert_close(p.data, theta - lr * expected_g, atol=5e-5, rtol=1e-6)
 
 
 @pytest.mark.parametrize("n", [1, 4])
@@ -204,14 +206,24 @@ def test_lozo_gradient_average_1d(n):
     theta = p.data.clone()
 
     opt = LOZO([p], lr=lr, zo_eps=zo_eps, rank=1, num_pert_samples=n, weight_decay=0.0)
+    a = a.to(device=p.device, dtype=p.dtype)
     opt.step(lambda: (a * p).sum(), z_seed=z_seed)
+    p_after_opt = p.data.clone()
 
-    expected_z_acc = torch.zeros_like(theta)
+    expected_z_acc = torch.zeros_like(theta, dtype=torch.float32)
     for seed_i in _sample_seeds(z_seed, n):
-        z_i = _lozo_z1d(seed_i, p.shape, param_idx=0).to(theta.dtype)
-        # projected_grad_i = (f+ - f-) / (2*eps) = <a, z_i>
-        proj_i = (a * z_i).sum().item()
-        expected_z_acc += z_i * proj_i
+        z_i = _lozo_z1d(p, seed_i, param_idx=0)
+        # Same float32 path as LOZO.step: proj_i = (f+ − f−) / (2ε), not (a·z) in one matmul
+        # (catastrophic cancellation makes them differ by ~1e-4 in fp32).
+        p.data.copy_(theta + zo_eps * z_i)
+        lp = (a * p).sum()
+        p.data.copy_(theta - zo_eps * z_i)
+        lm = (a * p).sum()
+        p.data.copy_(theta)
+        proj_i = (lp - lm).item() / (2.0 * zo_eps)
+        expected_z_acc += z_i.float() * proj_i
     expected_z_acc /= n
 
-    torch.testing.assert_close(p.data, theta - lr * expected_z_acc, atol=1e-5, rtol=0)
+    torch.testing.assert_close(
+        p_after_opt, theta - lr * expected_z_acc.to(theta.dtype), atol=1.2e-4, rtol=1e-5
+    )
