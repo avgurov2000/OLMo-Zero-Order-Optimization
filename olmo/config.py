@@ -59,6 +59,7 @@ __all__ = [
     "SingleGPUConfig",
     "CheckpointType",
     "ZOProbeConfig",
+    "PhaseSwitchConfig",
 ]
 
 C = TypeVar("C", bound="BaseConfig")
@@ -796,6 +797,33 @@ class ZOProbeConfig(BaseConfig):
 
 
 @dataclass
+class PhaseSwitchConfig(BaseConfig):
+    """Switch from a first-order (AdamW) warm-up phase to the main optimizer.
+
+    Phase 1 runs a plain AdamW + cosine-with-warmup for ``switch_after`` steps (or
+    tokens), then the main ``optimizer`` / ``scheduler`` from ``TrainConfig`` take over.
+    Both LRs and schedulers are independent; only the switch condition is shared.
+    """
+
+    switch_after: int = 1000
+    """Steps or tokens (see ``switch_units``) before switching to the main optimizer."""
+
+    switch_units: str = "steps"
+    """``'steps'`` or ``'tokens'`` — which counter to compare against ``switch_after``."""
+
+    # Phase 1 AdamW params
+    learning_rate: float = 4.0e-4
+    weight_decay: float = 0.1
+    betas: List[float] = field(default_factory=lambda: [0.9, 0.95])
+    eps: float = 1e-8
+
+    # Phase 1 cosine_with_warmup scheduler (units = same as switch_units)
+    t_warmup: int = 0
+    alpha_f: float = 0.1
+    warmup_min_lr: float = 0.0
+
+
+@dataclass
 class CompilerConfig(BaseConfig):
     mode: Optional[str] = None
     """
@@ -1293,6 +1321,13 @@ class TrainConfig(BaseConfig):
     """
     ZO divergence probe: measures cosine similarity between AdamW gradient and MeZO/ZOMuon
     update directions each ``probe_interval`` steps.  Only active for first-order optimizers.
+    """
+
+    phase_switch: Optional[PhaseSwitchConfig] = None
+    """
+    Optional two-phase training: phase 1 uses AdamW (FO) for ``switch_after`` steps/tokens,
+    then switches to the main optimizer (which can be ZO or FO).  Each phase has its own LR
+    and cosine-with-warmup scheduler.
     """
 
     speed_monitor: SpeedMonitorConfig = field(default_factory=SpeedMonitorConfig)

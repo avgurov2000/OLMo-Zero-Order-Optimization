@@ -35,6 +35,7 @@ from .config import (
     CheckpointType,
     DDPGradSyncMode,
     DistributedStrategy,
+    PhaseSwitchConfig,
     SchedulerUnits,
     ShardedCheckpointerType,
     SpeedMonitorConfig,
@@ -47,7 +48,7 @@ from .exceptions import OLMoConfigurationError
 from .model import OLMo
 from torch.optim import Optimizer as TorchOptimizer
 
-from .optim import Scheduler
+from .optim import CosWithWarmup, Scheduler
 from .torch_util import (
     SingleAccelerator,
     barrier,
@@ -260,6 +261,27 @@ class Trainer:
             )
         else:
             self._zo_probe = None
+
+        ps: Optional[PhaseSwitchConfig] = self.cfg.phase_switch
+        if ps is not None:
+            all_params = [p for group in self.optim.param_groups for p in group["params"]]
+            self._phase1_optim: Optional[torch.optim.AdamW] = torch.optim.AdamW(
+                all_params,
+                lr=ps.learning_rate,
+                betas=tuple(ps.betas),  # type: ignore[arg-type]
+                eps=ps.eps,
+                weight_decay=ps.weight_decay,
+            )
+            self._phase1_scheduler: Optional[CosWithWarmup] = CosWithWarmup(
+                grad_clip_warmup_steps=None,
+                grad_clip_warmup_factor=None,
+                warmup_steps=ps.t_warmup,
+                alpha_f=ps.alpha_f,
+                warmup_min_lr=ps.warmup_min_lr,
+            )
+        else:
+            self._phase1_optim = None
+            self._phase1_scheduler = None
 
     @property
     def dataset(self) -> IterableDataset:
@@ -926,7 +948,61 @@ class Trainer:
 
         return metrics
 
+    @property
+    def _phase1_sched_current(self) -> int:
+        ps = self.cfg.phase_switch
+        assert ps is not None
+        return self.global_step if ps.switch_units == "steps" else self.global_train_tokens_seen
+
+    @property
+    def _in_phase1(self) -> bool:
+        if self._phase1_optim is None:
+            return False
+        return self._phase1_sched_current < self.cfg.phase_switch.switch_after  # type: ignore[union-attr]
+
+    def _train_step_phase1(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
+        """FO AdamW warm-up step (phase 1).  Runs forward+backward; no ZO closures."""
+        metrics: Dict[str, float] = {}
+        ps = self.cfg.phase_switch
+        assert ps is not None and self._phase1_optim is not None and self._phase1_scheduler is not None
+
+        self._phase1_optim.zero_grad(set_to_none=True)
+        batch = move_to_device(batch, self.device)
+        ce_batch_loss, z_batch_loss = self.train_batch(batch)
+
+        if reduce_global_loss:
+            dist.reduce(ce_batch_loss, 0)
+            ce_batch_loss.div_(get_world_size())
+            if z_batch_loss is not None:
+                dist.reduce(z_batch_loss, 0)
+                z_batch_loss.div_(get_world_size())
+
+        # Gradient clipping (mirrors main FO path; no fancy metric collection).
+        if self.cfg.max_grad_norm is not None and self.cfg.max_grad_norm > 0:
+            all_params = [p for g in self._phase1_optim.param_groups for p in g["params"]]
+            grad_norm = torch.nn.utils.clip_grad_norm_(all_params, self.cfg.max_grad_norm)
+            metrics["train/phase1_grad_norm"] = grad_norm.item()
+
+        # LR from phase1 scheduler.
+        lr = self._phase1_scheduler.get_lr(ps.learning_rate, self._phase1_sched_current, ps.switch_after)
+        for group in self._phase1_optim.param_groups:
+            group["lr"] = lr
+
+        self._phase1_optim.step()
+
+        if torch.isnan(ce_batch_loss):
+            raise ValueError("nan loss encountered")
+
+        metrics["train/ce_loss"] = ce_batch_loss.item()
+        if z_batch_loss is not None:
+            metrics["train/z_loss"] = z_batch_loss.item()
+        metrics["train/phase1_lr"] = lr
+        metrics["train/phase1_active"] = 1.0
+        return metrics
+
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
+        if self._in_phase1:
+            return self._train_step_phase1(batch, reduce_global_loss=reduce_global_loss)
         if isinstance(self.optim, ZeroOrderOptimizer):
             return self._train_step_zero_order(batch, reduce_global_loss=reduce_global_loss)
 
