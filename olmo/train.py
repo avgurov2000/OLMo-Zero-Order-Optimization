@@ -35,6 +35,7 @@ from .config import (
     CheckpointType,
     DDPGradSyncMode,
     DistributedStrategy,
+    HybridFOConfig,
     PhaseSwitchConfig,
     SchedulerUnits,
     ShardedCheckpointerType,
@@ -62,7 +63,8 @@ from .torch_util import (
     synchronize_flag,
     synchronize_value,
 )
-from .zo_optim import ZeroOrderOptimizer
+from .ldsd_optim import LDSDMuon
+from .zo_optim import ZeroOrderOptimizer, ZoAdam
 from .zo_probe import ZODivergenceProbe
 from .util import upload
 
@@ -282,6 +284,92 @@ class Trainer:
         else:
             self._phase1_optim = None
             self._phase1_scheduler = None
+
+        # Hybrid FO+ZO setup: split params into FO subset (head+embed) and ZO rest.
+        hf: Optional[HybridFOConfig] = self.cfg.hybrid_fo
+        if hf is not None:
+            if self.cfg.phase_switch is not None:
+                raise OLMoConfigurationError(
+                    "hybrid_fo and phase_switch are mutually exclusive — pick one."
+                )
+            if not isinstance(self.optim, (ZoAdam, LDSDMuon)):
+                raise OLMoConfigurationError(
+                    "hybrid_fo currently supports main optimizer of type ZoAdam or LDSDMuon, "
+                    f"got {type(self.optim).__name__}.  Other ZO variants (LOZO, ZOMuon, LDSDRl, "
+                    "etc.) have different perturb/apply contracts and are not wired into the "
+                    "hybrid step yet."
+                )
+            self._fo_param_names, self._fo_params, self._zo_params = self._split_fo_zo_params(hf)
+            if len(self._fo_params) == 0:
+                raise OLMoConfigurationError(
+                    f"hybrid_fo.param_patterns matched zero parameters; patterns: {hf.param_patterns}"
+                )
+            self._strip_params_from_main_optim(self._fo_params)
+            self._fo_optim: Optional[torch.optim.AdamW] = torch.optim.AdamW(
+                self._fo_params,
+                lr=hf.learning_rate,
+                betas=tuple(hf.betas),  # type: ignore[arg-type]
+                eps=hf.eps,
+                weight_decay=hf.weight_decay,
+            )
+            self._fo_scheduler: Optional[CosWithWarmup] = CosWithWarmup(
+                grad_clip_warmup_steps=None,
+                grad_clip_warmup_factor=None,
+                warmup_steps=hf.t_warmup,
+                alpha_f=hf.alpha_f,
+                warmup_min_lr=hf.warmup_min_lr,
+            )
+            log.info(
+                "Hybrid FO+ZO mode: %d FO params (%s), %d ZO params remain in main optimizer",
+                len(self._fo_params),
+                ", ".join(self._fo_param_names),
+                len(self._zo_params),
+            )
+        else:
+            self._fo_param_names: List[str] = []
+            self._fo_params: List[torch.nn.Parameter] = []
+            self._zo_params: List[torch.nn.Parameter] = []
+            self._fo_optim = None
+            self._fo_scheduler = None
+
+    def _split_fo_zo_params(
+        self, hf: HybridFOConfig
+    ) -> Tuple[List[str], List[torch.nn.Parameter], List[torch.nn.Parameter]]:
+        import re
+
+        patterns = [re.compile(pat) for pat in hf.param_patterns]
+        fo_names: List[str] = []
+        fo_params: List[torch.nn.Parameter] = []
+        seen_fo_ids: set = set()
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if any(pat.fullmatch(name) for pat in patterns):
+                if id(p) in seen_fo_ids:
+                    continue  # weight-tying: same tensor matched twice
+                fo_names.append(name)
+                fo_params.append(p)
+                seen_fo_ids.add(id(p))
+
+        zo_params: List[torch.nn.Parameter] = []
+        seen_zo_ids: set = set()
+        for _, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if id(p) in seen_fo_ids or id(p) in seen_zo_ids:
+                continue
+            zo_params.append(p)
+            seen_zo_ids.add(id(p))
+        return fo_names, fo_params, zo_params
+
+    def _strip_params_from_main_optim(self, fo_params: List[torch.nn.Parameter]) -> None:
+        """Remove fo_params from self.optim.param_groups so ZO _perturb/_apply_update ignores them."""
+        fo_ids = {id(p) for p in fo_params}
+        for group in self.optim.param_groups:
+            kept_indices = [i for i, p in enumerate(group["params"]) if id(p) not in fo_ids]
+            group["params"] = [group["params"][i] for i in kept_indices]
+            if "param_names" in group:
+                group["param_names"] = [group["param_names"][i] for i in kept_indices]
 
     @property
     def dataset(self) -> IterableDataset:
@@ -1000,9 +1088,203 @@ class Trainer:
         metrics["train/phase1_active"] = 1.0
         return metrics
 
+    @property
+    def _fo_sched_current(self) -> int:
+        return self.scheduler_current
+
+    @property
+    def _fo_sched_max(self) -> int:
+        hf = self.cfg.hybrid_fo
+        if hf is not None and hf.t_max is not None:
+            return hf.t_max
+        return self.scheduler_max
+
+    def _train_step_hybrid(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
+        """Hybrid FO+ZO step: FO AdamW on head+embed via autograd, ZO body via SPSA.
+
+        Total forward passes per step: 2 (same as plain two-sided ZO).  The FO
+        backward piggy-backs on the +ε perturbed forward, so no extra forward
+        is needed.  ZO body params are temporarily set to ``requires_grad=False``
+        around the FO forward so autograd does not trace them (saves memory and
+        avoids spurious ``.grad`` writes).
+        """
+        assert self.cfg.hybrid_fo is not None
+        assert self._fo_optim is not None and self._fo_scheduler is not None
+        hf = self.cfg.hybrid_fo
+        metrics: Dict[str, float] = {}
+
+        if self.indices_file is not None and "index" in batch:
+            indices = "\t".join(str(int(i)) for i in batch["index"])
+            self.indices_file.write(f"{self.global_step}\t{indices}\n")
+
+        if (instance_mask := batch.get("instance_mask")) is not None:
+            metrics["train/masked_instances_local_rank"] = (~instance_mask).sum().item()
+
+        # Sync z_seed across DDP ranks so all ranks perturb identically.
+        z_seed: int
+        if is_distributed():
+            z_seed_local = int(np.random.randint(0, 1_000_000_000)) if get_global_rank() == 0 else 0
+            z_seed = int(synchronize_value(z_seed_local, self.device))
+        else:
+            z_seed = int(np.random.randint(0, 1_000_000_000))
+
+        batch = move_to_device(batch, self.device)
+        batch_size_in_tokens = batch["input_ids"].numel()
+        micro_batches = self.split_batch(batch)
+        num_micro_batches = len(micro_batches)
+
+        self._fo_optim.zero_grad(set_to_none=True)
+
+        # NOTE on ordering: ZoAdam._perturb / LDSDMuon._perturb_sequential skip params with
+        # requires_grad=False.  We therefore flip RG on ZO params *between* perturb calls,
+        # not around them, so each perturb sees requires_grad=True on the params it should touch.
+
+        zo_rg_saved = [p.requires_grad for p in self._zo_params]
+
+        # ---- Phase A: +ε perturb on ZO body (RG still True) ----
+        self._zo_perturb(z_seed, +1.0)
+
+        # Disable autograd on ZO params for the FO forward+backward only.
+        for p in self._zo_params:
+            p.requires_grad_(False)
+
+        try:
+            ce_batch_loss = torch.zeros((), device=self.device)
+            z_batch_loss: Optional[torch.Tensor] = (
+                None if not self.cfg.softmax_auxiliary_loss else torch.zeros((), device=self.device)
+            )
+            loss_plus_total = torch.zeros((), device=self.device, dtype=torch.float32)
+
+            for micro_batch_idx, micro_batch in enumerate(micro_batches):
+                grad_sync_context = nullcontext
+                if (
+                    self.cfg.distributed_strategy == DistributedStrategy.ddp
+                    and self.cfg.ddp is not None
+                    and self.cfg.ddp.grad_sync_mode == DDPGradSyncMode.batch
+                    and micro_batch_idx != num_micro_batches - 1
+                ):
+                    grad_sync_context = self.dist_model.no_sync
+
+                with grad_sync_context():
+                    autocast_device = "mps" if self.device.type == "mps" else "cuda"
+                    with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
+                        loss, ce_loss, z_loss = self.train_micro_batch(micro_batch, batch_size_in_tokens)
+                        ce_batch_loss = ce_batch_loss + ce_loss.detach()
+                        loss_plus_total = loss_plus_total + loss.detach().float()
+                        if z_loss is not None:
+                            assert z_batch_loss is not None
+                            z_batch_loss = z_batch_loss + z_loss.detach()
+                    loss.backward()
+
+            if is_distributed():
+                dist.all_reduce(loss_plus_total, op=dist.ReduceOp.SUM)
+                loss_plus_total = loss_plus_total / get_world_size()
+        finally:
+            # Restore requires_grad before next perturb so _perturb sees ZO params again.
+            for p, rg in zip(self._zo_params, zo_rg_saved):
+                p.requires_grad_(rg)
+
+        # ---- Phase B: -2ε perturb (now at -ε from θ), forward-only ----
+        self._zo_perturb(z_seed, -2.0)
+
+        loss_minus_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        with torch.inference_mode():
+            autocast_device = "mps" if self.device.type == "mps" else "cuda"
+            with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
+                for micro_batch in micro_batches:
+                    loss, _, _ = self.train_micro_batch(micro_batch, batch_size_in_tokens)
+                    loss_minus_total = loss_minus_total + loss.float()
+
+        if is_distributed():
+            dist.all_reduce(loss_minus_total, op=dist.ReduceOp.SUM)
+            loss_minus_total = loss_minus_total / get_world_size()
+
+        # ---- Phase C: restore +ε on ZO body (back to θ) ----
+        self._zo_perturb(z_seed, +1.0)
+
+        # ---- Apply ZO update via low-level optimizer helpers ----
+        lp = loss_plus_total.item()
+        lm = loss_minus_total.item()
+        scalar_half = (lp - lm) / 2.0  # (f⁺ − f⁻)/2; both ZoAdam and LDSDMuon expect this scaling.
+
+        if isinstance(self.optim, ZoAdam):
+            self.optim._apply_update([(z_seed, scalar_half)])
+            self.optim._last_metrics["projected_grad_abs"] = abs(scalar_half)
+        elif isinstance(self.optim, LDSDMuon):
+            self.optim._apply_muon_update(z_seed, scalar_half)
+            self.optim._last_metrics["projected_grad_abs"] = abs(scalar_half)
+        else:  # pragma: no cover — guarded in __post_init__
+            raise RuntimeError(f"Unsupported hybrid ZO optimizer: {type(self.optim).__name__}")
+
+        # ---- FO update: clip + LR + step ----
+        if self.cfg.max_grad_norm is not None and self.cfg.max_grad_norm > 0:
+            fo_grad_norm = torch.nn.utils.clip_grad_norm_(self._fo_params, self.cfg.max_grad_norm)
+            metrics["optim/fo/grad_norm"] = fo_grad_norm.item()
+
+        fo_lr = self._fo_scheduler.get_lr(hf.learning_rate, self._fo_sched_current, self._fo_sched_max)
+        for group in self._fo_optim.param_groups:
+            group["lr"] = fo_lr
+        self._fo_optim.step()
+
+        # ---- Set LR for the main ZO optimizer (no .step needed — _apply_update already applied) ----
+        zo_lr = self.scheduler.get_lr(
+            self.cfg.optimizer.learning_rate, self.scheduler_current, self.scheduler_max
+        )
+        for group in self.optim.param_groups:
+            group["lr"] = zo_lr
+
+        # ---- Loss reduction for logging ----
+        if reduce_global_loss:
+            dist.reduce(ce_batch_loss, 0)
+            ce_batch_loss.div_(get_world_size())
+            if z_batch_loss is not None:
+                dist.reduce(z_batch_loss, 0)
+                z_batch_loss.div_(get_world_size())
+
+        if torch.isnan(ce_batch_loss):
+            raise ValueError("nan loss encountered")
+
+        self.cur_train_loss = ce_batch_loss.item()
+        self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)
+        metrics["train/CrossEntropyLoss"] = self.cur_train_loss
+        metrics["train/Perplexity"] = math.exp(self.cur_train_loss)
+        if z_batch_loss is not None:
+            metrics["train/ZLoss"] = z_batch_loss.item()
+
+        metrics["optim/fo/lr"] = fo_lr
+        metrics["optim/zo/lr"] = zo_lr
+        metrics["optim/zo/loss_plus"] = lp
+        metrics["optim/zo/loss_minus"] = lm
+
+        should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
+        if should_log_optim_metrics_this_step and hasattr(self.optim, "get_post_step_metrics"):
+            optim_metrics = self.optim.get_post_step_metrics(
+                self.dist_model, process_group=self.dist_model.process_group
+            )
+            for k, v in optim_metrics.items():
+                metrics[f"optim/zo/{k}"] = v.item()
+
+        if torch.cuda.is_available() and self.global_step % max(1, self.cfg.console_log_interval) == 0:
+            peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            metrics["train/peak_mem_mb"] = peak_mb
+            torch.cuda.reset_peak_memory_stats()
+
+        return metrics
+
+    def _zo_perturb(self, z_seed: int, scaling_factor: float) -> None:
+        """Dispatch to the main optimizer's _perturb helper (signature matches both)."""
+        if isinstance(self.optim, ZoAdam):
+            self.optim._perturb(z_seed, scaling_factor)
+        elif isinstance(self.optim, LDSDMuon):
+            self.optim._perturb_sequential(z_seed, scaling_factor)
+        else:  # pragma: no cover — guarded in __post_init__
+            raise RuntimeError(f"Unsupported hybrid ZO optimizer: {type(self.optim).__name__}")
+
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
         if self._in_phase1:
             return self._train_step_phase1(batch, reduce_global_loss=reduce_global_loss)
+        if self._fo_optim is not None:
+            return self._train_step_hybrid(batch, reduce_global_loss=reduce_global_loss)
         if isinstance(self.optim, ZeroOrderOptimizer):
             return self._train_step_zero_order(batch, reduce_global_loss=reduce_global_loss)
 

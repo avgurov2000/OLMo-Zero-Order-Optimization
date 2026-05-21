@@ -60,6 +60,7 @@ __all__ = [
     "CheckpointType",
     "ZOProbeConfig",
     "PhaseSwitchConfig",
+    "HybridFOConfig",
 ]
 
 C = TypeVar("C", bound="BaseConfig")
@@ -824,6 +825,53 @@ class PhaseSwitchConfig(BaseConfig):
 
 
 @dataclass
+class HybridFOConfig(BaseConfig):
+    """Hybrid FO+ZO training: a fixed subset of parameters (typically the embeddings
+    and the LM head) is trained with a first-order AdamW step, while the rest of the
+    model is trained with the main (zero-order) optimizer from ``TrainConfig.optimizer``.
+
+    Both updates happen on **every** training step.  The FO gradient is collected via
+    ``backward`` during the +ε perturbed forward; the ZO body is perturbed *around*
+    this FO forward.  Total forward passes per step is the same as plain ZO (2 with
+    two-sided FD), since the FO backward piggy-backs on one of the perturbed forwards.
+
+    Notes for DDP
+    -------------
+    ZO body parameters have ``requires_grad`` temporarily flipped off around the FO
+    forward+backward, so DDP must be configured with ``find_unused_params=True`` and
+    ``grad_sync_mode=micro_batch`` for the FO sync to work correctly.
+    """
+
+    param_patterns: List[str] = field(
+        default_factory=lambda: [r"transformer\.wte\.weight", r"transformer\.ff_out\.weight"]
+    )
+    """Regex patterns matched against ``named_parameters()`` keys (``re.fullmatch``).
+    Matched parameters train with the FO optimizer; the rest train with the main ZO optimizer.
+    Defaults select the input embedding (``transformer.wte.weight``) and the LM head
+    (``transformer.ff_out.weight``).  With ``weight_tying=True`` the LM head does not exist;
+    only ``wte.weight`` matches and that single shared tensor goes to FO."""
+
+    learning_rate: float = 4.0e-4
+    """Peak LR for the FO AdamW optimizer over the FO param subset."""
+
+    weight_decay: float = 0.1
+    betas: List[float] = field(default_factory=lambda: [0.9, 0.95])
+    eps: float = 1e-8
+
+    t_warmup: int = 0
+    """FO scheduler warmup, in scheduler units (same units as the main scheduler)."""
+
+    t_max: Optional[int] = None
+    """FO scheduler total horizon, in scheduler units.  If ``None``, falls back to the
+    main scheduler's ``t_max``.  This lets the FO LR decay independently of ZO."""
+
+    alpha_f: float = 0.1
+    """Cosine floor as a fraction of peak FO LR."""
+
+    warmup_min_lr: float = 0.0
+
+
+@dataclass
 class CompilerConfig(BaseConfig):
     mode: Optional[str] = None
     """
@@ -1328,6 +1376,13 @@ class TrainConfig(BaseConfig):
     Optional two-phase training: phase 1 uses AdamW (FO) for ``switch_after`` steps/tokens,
     then switches to the main optimizer (which can be ZO or FO).  Each phase has its own LR
     and cosine-with-warmup scheduler.
+    """
+
+    hybrid_fo: Optional[HybridFOConfig] = None
+    """
+    Optional hybrid FO+ZO training: head + embeddings train with FO AdamW (via autograd),
+    the rest of the model trains with the main ZO optimizer.  Both updates happen every
+    step.  Mutually exclusive with ``phase_switch``.
     """
 
     speed_monitor: SpeedMonitorConfig = field(default_factory=SpeedMonitorConfig)
