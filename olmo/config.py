@@ -59,6 +59,7 @@ __all__ = [
     "SingleGPUConfig",
     "CheckpointType",
     "ZOProbeConfig",
+    "ZOAdamFOGradCompareConfig",
     "PhaseSwitchConfig",
     "HybridFOConfig",
 ]
@@ -798,6 +799,20 @@ class ZOProbeConfig(BaseConfig):
 
 
 @dataclass
+class ZOAdamFOGradCompareConfig(BaseConfig):
+    """Compare FO autograd gradient norms with ZoAdam SPSA estimates during ZO training.
+
+    On each probe step the trainer runs one extra forward+backward (FO gradient at θ),
+    then the usual ZoAdam step on the same batch.  Metrics use variant-A reconstruction
+    ``g_fo^zo = (g_fo · z) z`` averaged over ``num_pert_samples``.  Only active when
+    the main optimizer is ``zo_adam``.
+    """
+
+    enabled: bool = True
+    probe_interval: int = 1
+
+
+@dataclass
 class PhaseSwitchConfig(BaseConfig):
     """Switch from a first-order (AdamW) warm-up phase to the main optimizer.
 
@@ -1369,6 +1384,12 @@ class TrainConfig(BaseConfig):
     """
     ZO divergence probe: measures cosine similarity between AdamW gradient and MeZO/ZOMuon
     update directions each ``probe_interval`` steps.  Only active for first-order optimizers.
+    """
+
+    zo_adam_fo_compare: Optional[ZOAdamFOGradCompareConfig] = None
+    """
+    FO vs ZoAdam gradient-norm comparison during zero-order ZoAdam training.  Logs
+    ``zo_fo_compare/*`` metrics to W&B each ``probe_interval`` steps.
     """
 
     phase_switch: Optional[PhaseSwitchConfig] = None

@@ -256,6 +256,7 @@ class ZoAdam(ZeroOrderOptimizer):
         self.vector_sampler = VectorSampler(vector_sampling_type)
         self._generators: dict[torch.device, torch.Generator] = {}
         self._last_metrics: dict[str, float] = {}
+        self._last_pert_samples: list[tuple[int, float]] = []
 
     def _get_generator(self, device: torch.device) -> torch.Generator:
         if device not in self._generators:
@@ -322,6 +323,7 @@ class ZoAdam(ZeroOrderOptimizer):
 
             samples.append((seed_i, scalar))
 
+        self._last_pert_samples = list(samples)
         self._apply_update(samples)
         self._last_metrics["projected_grad_abs"] = sum(abs(s) for _, s in samples) / num_pert
         return first_loss  # type: ignore[return-value]

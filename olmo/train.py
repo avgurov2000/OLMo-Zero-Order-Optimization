@@ -41,6 +41,7 @@ from .config import (
     ShardedCheckpointerType,
     SpeedMonitorConfig,
     TrainConfig,
+    ZOAdamFOGradCompareConfig,
     ZOProbeConfig,
 )
 from .data import IterableDataset
@@ -65,7 +66,7 @@ from .torch_util import (
 )
 from .ldsd_optim import LDSDMuon
 from .zo_optim import ZeroOrderOptimizer, ZoAdam
-from .zo_probe import ZODivergenceProbe
+from .zo_probe import ZOAdamFOGradCompare, ZODivergenceProbe
 from .util import upload
 
 __all__ = ["SpeedMonitor", "LRMonitor", "Trainer"]
@@ -263,6 +264,14 @@ class Trainer:
             )
         else:
             self._zo_probe = None
+
+        compare_cfg: Optional[ZOAdamFOGradCompareConfig] = self.cfg.zo_adam_fo_compare
+        if compare_cfg is not None and compare_cfg.enabled and isinstance(self.optim, ZoAdam):
+            self._zo_fo_compare: Optional[ZOAdamFOGradCompare] = ZOAdamFOGradCompare(
+                probe_interval=compare_cfg.probe_interval,
+            )
+        else:
+            self._zo_fo_compare = None
 
         ps: Optional[PhaseSwitchConfig] = self.cfg.phase_switch
         if ps is not None:
@@ -978,6 +987,12 @@ class Trainer:
         batch_size_in_tokens = batch["input_ids"].numel()
         micro_batches = self.split_batch(batch)
 
+        run_fo_compare = (
+            self._zo_fo_compare is not None and self._zo_fo_compare.should_run(self.global_step)
+        )
+        if run_fo_compare:
+            self.train_batch(batch)
+
         z_seed: Optional[int] = None
         if is_distributed():
             z_seed_local = int(np.random.randint(0, 1_000_000_000)) if get_global_rank() == 0 else 0
@@ -1028,6 +1043,11 @@ class Trainer:
             )
             for key, value in optim_metrics.items():
                 metrics[f"optim/{key}"] = value.item()
+
+        if run_fo_compare and isinstance(self.optim, ZoAdam):
+            for _k, _v in self._zo_fo_compare.compute_metrics(self.optim).items():
+                metrics[f"zo_fo_compare/{_k}"] = _v
+            metrics["zo_fo_compare/lr"] = self.optim.param_groups[0]["lr"]
 
         self.cur_train_loss = ce_batch_loss.item()
         self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)

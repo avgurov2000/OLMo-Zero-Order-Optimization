@@ -1,4 +1,6 @@
-"""ZO Divergence Probe: measures alignment between AdamW and ZO update directions.
+"""ZO probes: divergence (AdamW vs MeZO/ZOMuon) and FO vs ZoAdam gradient norms.
+
+ZO Divergence Probe: measures alignment between AdamW and ZO update directions.
 
 On each probe step, computes a MeZO and/or ZOMuon update direction (forward-only,
 no backward) on the same batch that AdamW just processed, then logs cosine similarity
@@ -16,11 +18,14 @@ and the ZO direction is identical on all ranks, the cosine sim is the same every
 from __future__ import annotations
 
 import math
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 import torch
 
 from .zo_optim import _newtonschulz5
+
+if TYPE_CHECKING:
+    from .zo_optim import ZoAdam
 
 
 class ZODivergenceProbe:
@@ -240,3 +245,102 @@ class ZODivergenceProbe:
 
         cos = dot / (math.sqrt(sq_g * sq_zo) + 1e-8)
         return {"zomuon_cosine": cos, "zomuon_scalar_abs": abs(scalar)}
+
+
+class ZOAdamFOGradCompare:
+    """Compare global L2 norms of FO autograd vs ZoAdam SPSA gradient estimates.
+
+    Variant A: reconstruct ``g_fo^zo = (g_fo · z) z`` with the same probe vectors ZoAdam
+    used, averaged over ``num_pert_samples``.  Call ``compute_metrics`` after
+    ``ZoAdam.step`` while ``p.grad`` still holds the FO backward from the same batch.
+    """
+
+    def __init__(self, probe_interval: int = 1):
+        self.probe_interval = probe_interval
+
+    def should_run(self, step: int) -> bool:
+        return step % self.probe_interval == 0
+
+    @staticmethod
+    def _trainable_params(optim: "ZoAdam") -> list[torch.Tensor]:
+        params: list[torch.Tensor] = []
+        for group in optim.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    params.append(p)
+        return params
+
+    @staticmethod
+    def fo_grad_norm(params: list[torch.Tensor]) -> float:
+        sq = 0.0
+        for p in params:
+            if p.grad is not None:
+                sq += p.grad.detach().float().norm().item() ** 2
+        return math.sqrt(sq)
+
+    def compute_metrics(self, optim: "ZoAdam") -> dict[str, float]:
+        samples = optim._last_pert_samples
+        if not samples:
+            return {}
+
+        params = self._trainable_params(optim)
+        if not params or not any(p.grad is not None for p in params):
+            return {}
+
+        zo_eps = optim.defaults["zo_eps"]
+        n = len(samples)
+        zo_acc: dict[int, torch.Tensor] = {}
+        fo_recon_acc: dict[int, torch.Tensor] = {}
+        z_sum_sq = 0.0
+        for p in params:
+            zo_acc[id(p)] = torch.zeros_like(p, dtype=torch.float32)
+            fo_recon_acc[id(p)] = torch.zeros_like(p, dtype=torch.float32)
+
+        for seed_i, scalar_i in samples:
+            optim._reset_generators(seed_i)
+            z_map: dict[int, torch.Tensor] = {}
+            dot = 0.0
+            for p in params:
+                gen = optim._get_generator(p.device)
+                z = optim.vector_sampler.sample(p.shape, p.device, gen)
+                z_map[id(p)] = z
+                z_sum_sq += z.float().norm().item() ** 2
+                if p.grad is not None:
+                    dot += (p.grad.detach().float() * z.float()).sum().item()
+
+            for p in params:
+                z = z_map[id(p)]
+                zo_acc[id(p)].add_(z, alpha=scalar_i / zo_eps)
+                fo_recon_acc[id(p)].add_(z, alpha=dot)
+
+        zo_grad_sq = 0.0
+        fo_recon_sq = 0.0
+        for p in params:
+            zo_vec = zo_acc[id(p)].div_(n)
+            fo_vec = fo_recon_acc[id(p)].div_(n)
+            zo_grad_sq += zo_vec.norm().item() ** 2
+            fo_recon_sq += fo_vec.norm().item() ** 2
+
+        fo_grad_norm = self.fo_grad_norm(params)
+        zo_grad_norm = math.sqrt(zo_grad_sq)
+        fo_recon_norm = math.sqrt(fo_recon_sq)
+        z_probe_norm = math.sqrt(z_sum_sq) if z_sum_sq > 0.0 else float("nan")
+        grad_est_norm_ratio = (
+            zo_grad_norm / fo_grad_norm if fo_grad_norm > 0.0 else float("nan")
+        )
+        # ‖g_zo‖ / (‖g_fo‖ · ‖z‖) ≈ |cos(g_fo, z)| when SPSA is accurate.
+        grad_est_norm_per_fo_z_norm = (
+            zo_grad_norm / (fo_grad_norm * z_probe_norm)
+            if fo_grad_norm > 0.0 and z_probe_norm > 0.0
+            else float("nan")
+        )
+
+        return {
+            "fo_grad_norm": fo_grad_norm,
+            "zo_grad_est_norm": zo_grad_norm,
+            "grad_norm_diff_abs": abs(fo_grad_norm - zo_grad_norm),
+            "grad_est_norm_ratio": grad_est_norm_ratio,
+            "grad_est_norm_per_fo_z_norm": grad_est_norm_per_fo_z_norm,
+            "fo_zo_recon_norm": fo_recon_norm,
+            "recon_norm_diff_abs": abs(fo_recon_norm - zo_grad_norm),
+        }
