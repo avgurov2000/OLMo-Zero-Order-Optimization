@@ -66,7 +66,7 @@ from .torch_util import (
 )
 from .ldsd_optim import LDSDMuon
 from .zo_optim import ZeroOrderOptimizer, ZoAdam
-from .zo_probe import ZOAdamFOGradCompare, ZODivergenceProbe
+from .zo_probe import ZOAdamFOGradCompare, ZODivergenceProbe, register_zo_fo_compare_wandb_metrics
 from .util import upload
 
 __all__ = ["SpeedMonitor", "LRMonitor", "Trainer"]
@@ -1047,7 +1047,6 @@ class Trainer:
         if run_fo_compare and isinstance(self.optim, ZoAdam):
             for _k, _v in self._zo_fo_compare.compute_metrics(self.optim).items():
                 metrics[f"zo_fo_compare/{_k}"] = _v
-            metrics["zo_fo_compare/lr"] = self.optim.param_groups[0]["lr"]
 
         self.cur_train_loss = ce_batch_loss.item()
         self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)

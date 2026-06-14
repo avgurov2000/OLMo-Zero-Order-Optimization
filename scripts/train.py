@@ -21,8 +21,10 @@ from olmo.config import (
     CheckpointType,
     DDPGradSyncMode,
     DistributedStrategy,
+    OptimizerType,
     TrainConfig,
 )
+from olmo.zo_probe import register_zo_fo_compare_wandb_metrics
 from olmo.data import build_train_dataloader
 from olmo.eval import build_evaluators
 from olmo.exceptions import OLMoCliError, OLMoConfigurationError
@@ -122,6 +124,12 @@ def main(cfg: TrainConfig) -> None:
             tags=cfg.wandb.tags,
             config=cfg.asdict(exclude=["wandb"]),
         )
+        if (
+            cfg.zo_adam_fo_compare is not None
+            and cfg.zo_adam_fo_compare.enabled
+            and cfg.optimizer.name == OptimizerType.zo_adam
+        ):
+            register_zo_fo_compare_wandb_metrics()
 
     barrier()
 

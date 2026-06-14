@@ -5,14 +5,23 @@
 # Шаг оптимизатора — только zo-adam.
 #
 # Метрики в W&B (префикс zo_fo_compare/):
-#   fo_grad_norm         — ‖g_fo‖ (чистый autograd)
-#   zo_grad_est_norm     — ‖g_zo‖ (SPSA, до Adam-моментов)
-#   grad_norm_diff_abs   — |‖g_fo‖ − ‖g_zo‖|
-#   grad_est_norm_ratio  — ‖g_zo‖ / ‖g_fo‖ (нормировка на силу FO-градиента)
-#   grad_est_norm_per_fo_z_norm — ‖g_zo‖ / (‖g_fo‖·‖z‖) ≈ |cos(g_fo, z)|
-#   fo_zo_recon_norm     — ‖g_fo^zo‖, реконструкция (g_fo·z)z, усреднённая по пробам
-#   recon_norm_diff_abs  — |‖g_fo^zo‖ − ‖g_zo‖|
-#   lr                   — текущий lr zo-adam (reference FO lr в эксперименте тот же)
+#
+# По step (ось X = номер шага):
+#   zo_scalar                  — S = (L(θ+μz)−L(θ−μz)) / (2μ)
+#   norm_z                     — ‖z‖
+#   norm_zo                    — ‖g_zo‖
+#   norm_fo                    — ‖g_fo‖
+#   norm_proj_fo               — ‖proj_z(g_fo)‖
+#   sim_fo_z                   — cos(g_fo, z)
+#   grad_aligment_fo_z         — ⟨z, g_fo⟩²
+#   diff_norm_zo_fo            — |‖g_zo‖ − ‖g_fo‖|
+#   diff_norm_zo_fo_scaled     — |‖g_zo‖/√d − ‖g_fo‖|
+#   diff_norm_zo_proj_fo       — |‖g_zo‖ − ‖proj_z(g_fo)‖|
+#   diff_norm_zo_proj_fo_scaled — |‖g_zo‖/‖z‖² − ‖proj_z(g_fo)‖|
+#
+# Кастомная ось X (Y = S, X = alignment):
+#   scalar_sim                 — Y=S vs X=sim_fo_z
+#   scalar_grad_aligment_fo_z  — Y=S vs X=grad_aligment_fo_z
 #
 # Запуск (2 GPU):
 #   uv run torchrun --nproc_per_node=2 scripts/train.py \

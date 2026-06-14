@@ -247,12 +247,22 @@ class ZODivergenceProbe:
         return {"zomuon_cosine": cos, "zomuon_scalar_abs": abs(scalar)}
 
 
-class ZOAdamFOGradCompare:
-    """Compare global L2 norms of FO autograd vs ZoAdam SPSA gradient estimates.
+def register_zo_fo_compare_wandb_metrics() -> None:
+    """Register custom x-axes for scalar-vs-alignment W&B charts."""
+    import wandb
 
-    Variant A: reconstruct ``g_fo^zo = (g_fo · z) z`` with the same probe vectors ZoAdam
-    used, averaged over ``num_pert_samples``.  Call ``compute_metrics`` after
-    ``ZoAdam.step`` while ``p.grad`` still holds the FO backward from the same batch.
+    wandb.define_metric("zo_fo_compare/scalar_sim", step_metric="zo_fo_compare/sim_fo_z")
+    wandb.define_metric(
+        "zo_fo_compare/scalar_grad_aligment_fo_z",
+        step_metric="zo_fo_compare/grad_aligment_fo_z",
+    )
+
+
+class ZOAdamFOGradCompare:
+    """FO vs ZoAdam gradient diagnostics for W&B (``zo_fo_compare/*`` metrics).
+
+    Call ``compute_metrics`` after ``ZoAdam.step`` while ``p.grad`` still holds the FO
+    backward from the same batch.  Uses the same probe vectors and scalars as ZoAdam.
     """
 
     def __init__(self, probe_interval: int = 1):
@@ -271,7 +281,7 @@ class ZOAdamFOGradCompare:
         return params
 
     @staticmethod
-    def fo_grad_norm(params: list[torch.Tensor]) -> float:
+    def _fo_grad_norm(params: list[torch.Tensor]) -> float:
         sq = 0.0
         for p in params:
             if p.grad is not None:
@@ -289,58 +299,73 @@ class ZOAdamFOGradCompare:
 
         zo_eps = optim.defaults["zo_eps"]
         n = len(samples)
-        zo_acc: dict[int, torch.Tensor] = {}
-        fo_recon_acc: dict[int, torch.Tensor] = {}
-        z_sum_sq = 0.0
-        for p in params:
-            zo_acc[id(p)] = torch.zeros_like(p, dtype=torch.float32)
-            fo_recon_acc[id(p)] = torch.zeros_like(p, dtype=torch.float32)
+        num_params = sum(p.numel() for p in params)
+        sqrt_d = math.sqrt(num_params)
+
+        fo_grad_norm = self._fo_grad_norm(params)
+
+        zo_acc: dict[int, torch.Tensor] = {id(p): torch.zeros_like(p, dtype=torch.float32) for p in params}
+        zo_scalar_sum = 0.0
+        norm_z_sum = 0.0
+        norm_proj_fo_sum = 0.0
+        sim_sum = 0.0
+        grad_aligment_sum = 0.0
 
         for seed_i, scalar_i in samples:
+            # S = (L(θ+μz) − L(θ−μz)) / (2μ); ZoAdam stores (L+−L−)/2 in scalar_i.
+            s = scalar_i / zo_eps
+            zo_scalar_sum += s
+
             optim._reset_generators(seed_i)
-            z_map: dict[int, torch.Tensor] = {}
+            z_sq = 0.0
             dot = 0.0
             for p in params:
                 gen = optim._get_generator(p.device)
                 z = optim.vector_sampler.sample(p.shape, p.device, gen)
-                z_map[id(p)] = z
-                z_sum_sq += z.float().norm().item() ** 2
+                z_f = z.float()
+                z_sq += z_f.norm().item() ** 2
                 if p.grad is not None:
-                    dot += (p.grad.detach().float() * z.float()).sum().item()
+                    dot += (p.grad.detach().float() * z_f).sum().item()
+                zo_acc[id(p)].add_(z_f, alpha=s)
 
-            for p in params:
-                z = z_map[id(p)]
-                zo_acc[id(p)].add_(z, alpha=scalar_i / zo_eps)
-                fo_recon_acc[id(p)].add_(z, alpha=dot)
+            norm_z_i = math.sqrt(z_sq)
+            norm_z_sum += norm_z_i
+            norm_proj_fo_sum += abs(dot) / norm_z_i if norm_z_i > 0.0 else 0.0
+            sim_sum += dot / (fo_grad_norm * norm_z_i) if fo_grad_norm > 0.0 and norm_z_i > 0.0 else 0.0
+            grad_aligment_sum += dot * dot
+
+        zo_scalar = zo_scalar_sum / n
+        norm_z = norm_z_sum / n
+        norm_proj_fo = norm_proj_fo_sum / n
+        sim_fo_z = sim_sum / n
+        grad_aligment_fo_z = grad_aligment_sum / n
 
         zo_grad_sq = 0.0
-        fo_recon_sq = 0.0
         for p in params:
             zo_vec = zo_acc[id(p)].div_(n)
-            fo_vec = fo_recon_acc[id(p)].div_(n)
             zo_grad_sq += zo_vec.norm().item() ** 2
-            fo_recon_sq += fo_vec.norm().item() ** 2
+        norm_zo = math.sqrt(zo_grad_sq)
 
-        fo_grad_norm = self.fo_grad_norm(params)
-        zo_grad_norm = math.sqrt(zo_grad_sq)
-        fo_recon_norm = math.sqrt(fo_recon_sq)
-        z_probe_norm = math.sqrt(z_sum_sq) if z_sum_sq > 0.0 else float("nan")
-        grad_est_norm_ratio = (
-            zo_grad_norm / fo_grad_norm if fo_grad_norm > 0.0 else float("nan")
-        )
-        # ‖g_zo‖ / (‖g_fo‖ · ‖z‖) ≈ |cos(g_fo, z)| when SPSA is accurate.
-        grad_est_norm_per_fo_z_norm = (
-            zo_grad_norm / (fo_grad_norm * z_probe_norm)
-            if fo_grad_norm > 0.0 and z_probe_norm > 0.0
-            else float("nan")
+        diff_norm_zo_fo = abs(norm_zo - fo_grad_norm)
+        diff_norm_zo_fo_scaled = abs(norm_zo / sqrt_d - fo_grad_norm) if sqrt_d > 0.0 else float("nan")
+        diff_norm_zo_proj_fo = abs(norm_zo - norm_proj_fo)
+        diff_norm_zo_proj_fo_scaled = (
+            abs(norm_zo / (norm_z * norm_z) - norm_proj_fo) if norm_z > 0.0 else float("nan")
         )
 
         return {
-            "fo_grad_norm": fo_grad_norm,
-            "zo_grad_est_norm": zo_grad_norm,
-            "grad_norm_diff_abs": abs(fo_grad_norm - zo_grad_norm),
-            "grad_est_norm_ratio": grad_est_norm_ratio,
-            "grad_est_norm_per_fo_z_norm": grad_est_norm_per_fo_z_norm,
-            "fo_zo_recon_norm": fo_recon_norm,
-            "recon_norm_diff_abs": abs(fo_recon_norm - zo_grad_norm),
+            "zo_scalar": zo_scalar,
+            "norm_z": norm_z,
+            "norm_zo": norm_zo,
+            "norm_fo": fo_grad_norm,
+            "norm_proj_fo": norm_proj_fo,
+            "sim_fo_z": sim_fo_z,
+            "grad_aligment_fo_z": grad_aligment_fo_z,
+            "diff_norm_zo_fo": diff_norm_zo_fo,
+            "diff_norm_zo_fo_scaled": diff_norm_zo_fo_scaled,
+            "diff_norm_zo_proj_fo": diff_norm_zo_proj_fo,
+            "diff_norm_zo_proj_fo_scaled": diff_norm_zo_proj_fo_scaled,
+            # Same S on Y; custom W&B x-axis via define_metric (see register_zo_fo_compare_wandb_metrics).
+            "scalar_sim": zo_scalar,
+            "scalar_grad_aligment_fo_z": zo_scalar,
         }

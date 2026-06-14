@@ -1,5 +1,7 @@
 """Tests for ZOAdamFOGradCompare (FO vs ZoAdam gradient norm metrics)."""
 
+import math
+
 import torch
 
 from olmo.config import DistributedStrategy, OptimizerType, TrainConfig
@@ -36,20 +38,37 @@ def test_zo_adam_fo_compare_metrics_cpu():
 
     metrics = compare.compute_metrics(opt)
     expected_keys = {
-        "fo_grad_norm",
-        "zo_grad_est_norm",
-        "grad_norm_diff_abs",
-        "grad_est_norm_ratio",
-        "grad_est_norm_per_fo_z_norm",
-        "fo_zo_recon_norm",
-        "recon_norm_diff_abs",
+        "zo_scalar",
+        "norm_z",
+        "norm_zo",
+        "norm_fo",
+        "norm_proj_fo",
+        "sim_fo_z",
+        "grad_aligment_fo_z",
+        "diff_norm_zo_fo",
+        "diff_norm_zo_fo_scaled",
+        "diff_norm_zo_proj_fo",
+        "diff_norm_zo_proj_fo_scaled",
+        "scalar_sim",
+        "scalar_grad_aligment_fo_z",
     }
     assert set(metrics) == expected_keys
     for key in expected_keys:
-        assert metrics[key] >= 0.0
         assert metrics[key] == metrics[key]  # not NaN
-    assert abs(metrics["grad_est_norm_ratio"] - metrics["zo_grad_est_norm"] / metrics["fo_grad_norm"]) < 1e-6
+    assert metrics["scalar_sim"] == metrics["zo_scalar"]
+    assert metrics["scalar_grad_aligment_fo_z"] == metrics["zo_scalar"]
+    assert metrics["norm_zo"] >= 0.0
+    assert metrics["norm_fo"] >= 0.0
+    assert metrics["diff_norm_zo_fo"] == abs(metrics["norm_zo"] - metrics["norm_fo"])
+    assert metrics["diff_norm_zo_proj_fo"] == abs(metrics["norm_zo"] - metrics["norm_proj_fo"])
+
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    assert metrics["diff_norm_zo_fo_scaled"] == abs(
+        metrics["norm_zo"] / math.sqrt(num_params) - metrics["norm_fo"]
+    )
+    assert metrics["diff_norm_zo_proj_fo_scaled"] == abs(
+        metrics["norm_zo"] / (metrics["norm_z"] ** 2) - metrics["norm_proj_fo"]
+    )
 
     post = opt.get_post_step_metrics()
-    zo_ref = post["grad_est_norm"].item()
-    assert abs(metrics["zo_grad_est_norm"] - zo_ref) <= max(1.0, 1e-6 * zo_ref)
+    assert abs(metrics["norm_zo"] - post["grad_est_norm"].item()) <= max(1.0, 1e-6 * post["grad_est_norm"].item())

@@ -1389,7 +1389,7 @@ class TrainConfig(BaseConfig):
     zo_adam_fo_compare: Optional[ZOAdamFOGradCompareConfig] = None
     """
     FO vs ZoAdam gradient-norm comparison during zero-order ZoAdam training.  Logs
-    ``zo_fo_compare/*`` metrics to W&B each ``probe_interval`` steps.
+    ``zo_fo_compare/*`` metrics (see config header comments) to W&B each ``probe_interval`` steps.
     """
 
     phase_switch: Optional[PhaseSwitchConfig] = None
