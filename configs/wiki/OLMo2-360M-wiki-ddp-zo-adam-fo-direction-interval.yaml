@@ -1,21 +1,13 @@
-# OLMo2-360M — ZoAdam with cached FO direction as probe vector z.
+# OLMo2-360M — ZoAdam + cached z=g_fo, fixed-interval refresh.
 #
-# Training loop (zo_fo_direction):
-#   1. FO backward → cache z = g_fo
-#   2. ZO probe along z → scalar S
-#   3. If |S| < ‖g_fo‖·scalar_abs_fo_norm_ratio: refresh z from new FO backward
-#   4. If |S| >= threshold: ZoAdam update along cached z; keep z for next step until |S| drops
+# sampling_strategy: fo_direction_interval
+#   refresh z every refresh_interval global training steps
 #
-# Cost per step: 1–2 FO backward + 2 ZO forwards (two-sided), plus extra retries when |S| is low.
-#
-# Запуск (2 GPU):
+# Запуск:
 #   uv run torchrun --nproc_per_node=2 scripts/train.py \
-#       configs/wiki/OLMo2-360M-wiki-ddp-zo-adam-fo-direction.yaml
-#
-# IPv6 / localhost:
-#   export MASTER_ADDR=127.0.0.1
+#       configs/wiki/OLMo2-360M-wiki-ddp-zo-adam-fo-direction-interval.yaml
 
-run_name: OLMo2-360M-wiki-ddp-zo-adam-fo-direction
+run_name: OLMo2-360M-wiki-ddp-zo-adam-fo-direction-interval
 seed: 6198
 dry_run: false
 
@@ -92,14 +84,14 @@ zo_fo_direction:
   enabled: true
   max_refresh_retries: 10
   sampling_strategy:
-    strategy_type: fo_direction_norm_thrs
-    scalar_abs_fo_norm_ratio: 0.1
+    strategy_type: fo_direction_interval
+    refresh_interval: 100
 
 tokenizer:
   identifier: tokenizers/allenai_dolma2.json
   truncate_direction: right
 
-save_folder: ./runs/OLMo2-360M-wiki-ddp-zo-adam-fo-direction
+save_folder: ./runs/OLMo2-360M-wiki-ddp-zo-adam-fo-direction-interval
 save_overwrite: false
 
 save_interval: 1000

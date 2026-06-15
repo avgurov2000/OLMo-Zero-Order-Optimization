@@ -23,9 +23,9 @@ dry_run: false
 
 wandb:
   name: ${run_name}
-  project: olmo-wiki
+  project: zo-fo-compare
   group: ${run_name}
-  entity: null
+  entity: andrey
 
 model:
   d_model: 2048
@@ -92,8 +92,10 @@ scheduler:
 
 zo_fo_direction:
   enabled: true
-  scalar_abs_fo_norm_ratio: 0.1
   max_refresh_retries: 10
+  sampling_strategy:
+    strategy_type: fo_direction_norm_thrs
+    scalar_abs_fo_norm_ratio: 0.1
 
 tokenizer:
   identifier: tokenizers/allenai_dolma2.json
@@ -147,7 +149,7 @@ evaluators:
       persistent_workers: true
       memmap_dtype: uint32
       paths:
-        - /home/gur_andry/data/wikitext/validation/0_00000.npy
+        - /data/users/vtrofimov/OLMo-Zero-Order-Optimization/data/wikitext/validation/0_00000.npy
 
 data:
   pad_direction: right
@@ -163,6 +165,6 @@ data:
     repetition_min_period: 1
     repetition_max_count: 32
   paths:
-    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00000.npy
-    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00001.npy
-    - /home/gur_andry/data/olmo-wiki/train/wiki-0001/0_00002.npy
+    - /data/users/vtrofimov/OLMo-Zero-Order-Optimization/data/olmo-wiki/train/wiki-0001/0_00000.npy
+    - /data/users/vtrofimov/OLMo-Zero-Order-Optimization/data/olmo-wiki/train/wiki-0001/0_00001.npy
+    - /data/users/vtrofimov/OLMo-Zero-Order-Optimization/data/olmo-wiki/train/wiki-0001/0_00002.npy

@@ -67,6 +67,10 @@ from .torch_util import (
 )
 from .ldsd_optim import LDSDMuon
 from .zo_optim import ZeroOrderOptimizer, ZoAdam
+from .zo_fo_direction_strategy import (
+    ZoFODirectionRuntime,
+    build_zo_fo_direction_strategy,
+)
 from .zo_probe import ZOAdamFOGradCompare, ZODivergenceProbe, register_zo_fo_compare_wandb_metrics
 from .util import upload
 
@@ -288,13 +292,11 @@ class Trainer:
         if fo_dir_cfg is not None and fo_dir_cfg.enabled:
             if not isinstance(self.optim, ZoAdam):
                 raise OLMoConfigurationError("zo_fo_direction requires optimizer.name=zo_adam")
-            self._zo_fo_direction_cache: Optional[dict[int, torch.Tensor]] = None
-            self._zo_fo_direction_norm_fo: Optional[float] = None
-            self._zo_fo_direction_threshold: Optional[float] = None
+            self._zo_fo_direction_runtime = ZoFODirectionRuntime()
+            self._zo_fo_direction_strategy = build_zo_fo_direction_strategy(fo_dir_cfg.sampling_strategy)
         else:
-            self._zo_fo_direction_cache = None
-            self._zo_fo_direction_norm_fo = None
-            self._zo_fo_direction_threshold = None
+            self._zo_fo_direction_runtime = ZoFODirectionRuntime()
+            self._zo_fo_direction_strategy = None
 
         ps: Optional[PhaseSwitchConfig] = self.cfg.phase_switch
         if ps is not None:
@@ -1008,23 +1010,22 @@ class Trainer:
             sq += z.norm().item() ** 2
         return math.sqrt(sq)
 
-    def _refresh_zo_fo_direction_cache(self, batch: Dict[str, Any]) -> None:
-        fo_dir = self.cfg.zo_fo_direction
-        assert fo_dir is not None
+    def _refresh_zo_fo_direction_cache(self, batch: Dict[str, Any]) -> float:
         self.optim.zero_grad(set_to_none=True)
         self.train_batch(batch)
-        self._zo_fo_direction_cache = self._snapshot_fo_direction()
-        norm_fo = self._fo_direction_norm(self._zo_fo_direction_cache)
-        self._zo_fo_direction_norm_fo = norm_fo
-        self._zo_fo_direction_threshold = norm_fo * fo_dir.scalar_abs_fo_norm_ratio
+        self._zo_fo_direction_runtime.cache = self._snapshot_fo_direction()
+        return self._fo_direction_norm(self._zo_fo_direction_runtime.cache)
 
     def _train_step_zo_fo_direction(
         self, batch: Dict[str, Any], reduce_global_loss: bool = True
     ) -> Dict[str, float]:
-        """ZoAdam with cached ``z = g_fo``, refreshed when ``|S|`` drops below threshold."""
+        """ZoAdam with cached ``z = g_fo``; refresh policy from ``sampling_strategy``."""
         assert isinstance(self.optim, ZoAdam)
         fo_dir = self.cfg.zo_fo_direction
         assert fo_dir is not None and fo_dir.enabled
+        strategy = self._zo_fo_direction_strategy
+        assert strategy is not None
+        runtime = self._zo_fo_direction_runtime
 
         metrics: Dict[str, float] = {}
 
@@ -1058,39 +1059,38 @@ class Trainer:
             )
 
         zo_eps = self.optim.defaults["zo_eps"]
-        need_refresh = self._zo_fo_direction_cache is None
         refresh_attempts = 0
         backward_passes = 0
         forced_update = False
 
         loss: Optional[torch.Tensor] = None
         while True:
-            if need_refresh:
-                self._refresh_zo_fo_direction_cache(batch)
+            if strategy.should_refresh_before_probe(self.global_step, runtime):
+                norm_fo = self._refresh_zo_fo_direction_cache(batch)
+                strategy.on_direction_refreshed(self.global_step, runtime, norm_fo)
                 backward_passes += 1
-                need_refresh = False
                 refresh_attempts += 1
 
-            assert self._zo_fo_direction_cache is not None
-            assert self._zo_fo_direction_threshold is not None
-            threshold = self._zo_fo_direction_threshold
-            loss, raw_scalar = self.optim.estimate_with_direction(closure, self._zo_fo_direction_cache)
+            assert runtime.cache is not None
+            loss, raw_scalar = self.optim.estimate_with_direction(closure, runtime.cache)
             abs_S = abs(raw_scalar / zo_eps)
 
-            if abs_S >= threshold or refresh_attempts >= fo_dir.max_refresh_retries:
-                if abs_S < threshold:
+            apply_update, forced = strategy.should_apply_update(
+                abs_S, runtime, refresh_attempts, fo_dir.max_refresh_retries
+            )
+            if apply_update:
+                if forced:
                     forced_update = True
                     log.warning(
-                        "zo_fo_direction: |S|=%.3e below threshold %.3e after %d refresh attempts; "
+                        "zo_fo_direction[%s]: |S|=%.3e below threshold %.3e after %d refresh attempts; "
                         "applying update anyway.",
+                        strategy.strategy_type,
                         abs_S,
-                        threshold,
+                        runtime.scalar_threshold if runtime.scalar_threshold is not None else float("nan"),
                         refresh_attempts,
                     )
-                self.optim.apply_direction_update(raw_scalar, self._zo_fo_direction_cache)
+                self.optim.apply_direction_update(raw_scalar, runtime.cache)
                 break
-
-            need_refresh = True
 
         assert loss is not None
         ce_batch_loss = loss.detach()
@@ -1112,8 +1112,17 @@ class Trainer:
                 metrics[f"optim/{key}"] = value.item()
 
         metrics["zo_fo_direction/abs_S"] = abs_S
-        metrics["zo_fo_direction/norm_fo"] = self._zo_fo_direction_norm_fo or 0.0
-        metrics["zo_fo_direction/scalar_threshold"] = self._zo_fo_direction_threshold or 0.0
+        metrics["zo_fo_direction/norm_fo"] = runtime.norm_fo or 0.0
+        metrics["zo_fo_direction/scalar_threshold"] = (
+            runtime.scalar_threshold if runtime.scalar_threshold is not None else 0.0
+        )
+        metrics["zo_fo_direction/steps_since_refresh"] = (
+            float(self.global_step - runtime.last_refresh_step)
+            if runtime.last_refresh_step >= 0
+            else 0.0
+        )
+        for key, value in strategy.extra_metrics(runtime).items():
+            metrics[f"zo_fo_direction/{key}"] = value
         metrics["zo_fo_direction/refresh_attempts"] = float(refresh_attempts)
         metrics["zo_fo_direction/backward_passes"] = float(backward_passes)
         metrics["zo_fo_direction/direction_refreshed"] = float(backward_passes > 0)

@@ -61,6 +61,7 @@ __all__ = [
     "ZOProbeConfig",
     "ZOAdamFOGradCompareConfig",
     "ZoFODirectionConfig",
+    "ZoFOSamplingStrategyConfig",
     "PhaseSwitchConfig",
     "HybridFOConfig",
 ]
@@ -814,32 +815,53 @@ class ZOAdamFOGradCompareConfig(BaseConfig):
 
 
 @dataclass
+class ZoFOSamplingStrategyConfig(BaseConfig):
+    """How and when to refresh the cached FO probe direction ``z = g_fo``.
+
+    Supported ``strategy_type`` values:
+
+    - ``fo_direction_scalar_thrs`` — refresh when ``|S| < scalar_abs_threshold``.
+    - ``fo_direction_norm_thrs`` — refresh when ``|S| < ‖g_fo‖ · scalar_abs_fo_norm_ratio``.
+    - ``fo_direction_interval`` — refresh every ``refresh_interval`` global training steps.
+    """
+
+    strategy_type: str = "fo_direction_norm_thrs"
+    scalar_abs_threshold: Optional[float] = None
+    scalar_abs_fo_norm_ratio: Optional[float] = None
+    refresh_interval: Optional[int] = None
+
+
+@dataclass
 class ZoFODirectionConfig(BaseConfig):
     """ZoAdam training with a cached FO gradient direction as the probe vector ``z``.
 
-    Each training step:
-    1. If no cached direction or ``|S|`` from the previous probe fell below the dynamic
-       threshold, run FO backward and cache ``z = g_fo``.
-    2. Run a two-sided ZO probe along the cached ``z`` to obtain scalar ``S``.
-    3. If ``|S| < threshold``, refresh ``z`` from a new FO backward (same batch, weights
-       unchanged) and retry, up to ``max_refresh_retries``.
-    4. Otherwise apply the ZoAdam update along ``z``.
-
-    The threshold is set when ``g_fo`` is refreshed:
-    ``threshold = ‖g_fo‖ · scalar_abs_fo_norm_ratio`` and kept until the next refresh.
-
-    ``S`` is ``(L(θ+μz) − L(θ−μz)) / (2μ)``; the implementation stores ``(L⁺−L⁻)/2``
-    internally and divides by ``μ = zo_eps`` when comparing to the threshold.
-
+    Refresh policy is selected via ``sampling_strategy`` (see ``ZoFOSamplingStrategyConfig``).
     Only active when the main optimizer is ``zo_adam``.
     """
 
     enabled: bool = True
-    scalar_abs_fo_norm_ratio: float = 0.1
-    """Dynamic threshold: ``|S|`` must be at least ``‖g_fo‖ · scalar_abs_fo_norm_ratio``."""
-
     max_refresh_retries: int = 10
     """Max FO backward + re-probe attempts per training step before forcing an update."""
+
+    sampling_strategy: ZoFOSamplingStrategyConfig = field(default_factory=ZoFOSamplingStrategyConfig)
+
+    @classmethod
+    def update_legacy_settings(cls, config: D) -> D:
+        """Map pre-strategy flat keys into ``sampling_strategy``."""
+        if om.is_dict(config):
+            if "scalar_abs_fo_norm_ratio" in config and "sampling_strategy" not in config:
+                ratio = config.pop("scalar_abs_fo_norm_ratio")
+                config["sampling_strategy"] = {
+                    "strategy_type": "fo_direction_norm_thrs",
+                    "scalar_abs_fo_norm_ratio": ratio,
+                }
+            if "scalar_abs_threshold" in config and "sampling_strategy" not in config:
+                threshold = config.pop("scalar_abs_threshold")
+                config["sampling_strategy"] = {
+                    "strategy_type": "fo_direction_scalar_thrs",
+                    "scalar_abs_threshold": threshold,
+                }
+        return config
 
 
 @dataclass
@@ -1603,5 +1625,8 @@ class TrainConfig(BaseConfig):
 
             if hasattr(new_config, "optimizer"):
                 new_config.optimizer = OptimizerConfig.update_legacy_settings(new_config.optimizer)
+
+            if hasattr(new_config, "zo_fo_direction") and new_config.zo_fo_direction is not None:
+                new_config.zo_fo_direction = ZoFODirectionConfig.update_legacy_settings(new_config.zo_fo_direction)
 
         return new_config
