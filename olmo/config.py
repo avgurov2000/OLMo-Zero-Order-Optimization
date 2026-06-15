@@ -60,6 +60,7 @@ __all__ = [
     "CheckpointType",
     "ZOProbeConfig",
     "ZOAdamFOGradCompareConfig",
+    "ZoFODirectionConfig",
     "PhaseSwitchConfig",
     "HybridFOConfig",
 ]
@@ -813,6 +814,33 @@ class ZOAdamFOGradCompareConfig(BaseConfig):
 
 
 @dataclass
+class ZoFODirectionConfig(BaseConfig):
+    """ZoAdam training with a cached FO gradient direction as the probe vector ``z``.
+
+    Each training step:
+    1. If no cached direction or ``|S|`` from the previous probe fell below
+       ``scalar_abs_threshold``, run FO backward and cache ``z = g_fo``.
+    2. Run a two-sided ZO probe along the cached ``z`` to obtain scalar ``S``.
+    3. If ``|S| < scalar_abs_threshold``, refresh ``z`` from a new FO backward (same
+       batch, weights unchanged) and retry, up to ``max_refresh_retries``.
+    4. Otherwise apply the ZoAdam update along ``z``.
+
+  ``S`` is ``(L(θ+μz) − L(θ−μz)) / (2μ)``; the implementation stores
+  ``(L⁺−L⁻)/2`` internally and divides by ``μ = zo_eps`` when comparing to the
+  threshold.
+
+    Only active when the main optimizer is ``zo_adam``.
+    """
+
+    enabled: bool = True
+    scalar_abs_threshold: float = 1e-6
+    """Minimum ``|S|`` to accept the cached direction without refreshing ``g_fo``."""
+
+    max_refresh_retries: int = 10
+    """Max FO backward + re-probe attempts per training step before forcing an update."""
+
+
+@dataclass
 class PhaseSwitchConfig(BaseConfig):
     """Switch from a first-order (AdamW) warm-up phase to the main optimizer.
 
@@ -1390,6 +1418,12 @@ class TrainConfig(BaseConfig):
     """
     FO vs ZoAdam gradient-norm comparison during zero-order ZoAdam training.  Logs
     ``zo_fo_compare/*`` metrics (see config header comments) to W&B each ``probe_interval`` steps.
+    """
+
+    zo_fo_direction: Optional[ZoFODirectionConfig] = None
+    """
+    ZoAdam with cached ``z = g_fo`` probe direction, refreshed when ``|S|`` drops below
+    ``scalar_abs_threshold``.  Mutually exclusive with ``zo_adam_fo_compare`` (probe only).
     """
 
     phase_switch: Optional[PhaseSwitchConfig] = None

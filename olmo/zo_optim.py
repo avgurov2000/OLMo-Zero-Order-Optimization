@@ -408,6 +408,110 @@ class ZoAdam(ZeroOrderOptimizer):
         self._last_metrics["grad_est_norm_per_z_rms"] = (ge / z_rms) if z_rms > 0.0 else float("nan")
         self._last_metrics["update_norm"] = math.sqrt(update_sum_sq)
 
+    def _direction_for(self, p: torch.Tensor, direction: dict[int, torch.Tensor]) -> torch.Tensor:
+        z = direction.get(id(p))
+        if z is None:
+            raise KeyError(f"Missing FO direction for parameter id={id(p)}")
+        return z
+
+    @torch.no_grad()
+    def _perturb_direction(self, direction: dict[int, torch.Tensor], scaling_factor: float) -> None:
+        for group in self.param_groups:
+            zo_eps = group["zo_eps"]
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                z = self._direction_for(p, direction)
+                p.data.add_(z.to(dtype=p.dtype), alpha=scaling_factor * zo_eps)
+
+    @torch.no_grad()
+    def estimate_with_direction(
+        self,
+        closure: Callable[[], torch.Tensor],
+        direction: dict[int, torch.Tensor],
+    ) -> tuple[torch.Tensor, float]:
+        """Two-sided (or one-sided) SPSA scalar along fixed ``direction``; restores θ."""
+        self._perturb_direction(direction, scaling_factor=+1.0)
+        loss_plus = closure()
+
+        if self.defaults["perturbation_mode"] == "two_side":
+            self._perturb_direction(direction, scaling_factor=-2.0)
+            loss_minus = closure()
+            scalar = (loss_plus - loss_minus).item() / 2.0
+            self._perturb_direction(direction, scaling_factor=+1.0)
+        else:
+            self._perturb_direction(direction, scaling_factor=-1.0)
+            loss_minus = closure()
+            scalar = (loss_plus - loss_minus).item()
+            self._perturb_direction(direction, scaling_factor=+1.0)
+
+        return loss_plus, scalar
+
+    @torch.no_grad()
+    def apply_direction_update(self, scalar: float, direction: dict[int, torch.Tensor]) -> None:
+        """Apply ZoAdam update using ``g_est = (scalar/ε) · z`` from ``direction``."""
+        zo_eps = self.defaults["zo_eps"]
+        self._last_pert_samples = [(0, scalar)]
+
+        accumulators: dict[int, torch.Tensor] = {}
+        z_sum_sq = 0.0
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                z = self._direction_for(p, direction).float()
+                z_sum_sq += z.norm().item() ** 2
+                accumulators[id(p)] = z.mul(scalar / zo_eps)
+
+        grad_sum_sq = 0.0
+        update_sum_sq = 0.0
+        for group in self.param_groups:
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+            beta1, beta2 = group["betas"]
+            adam_eps = group["eps"]
+
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+
+                if weight_decay != 0.0:
+                    p.data.mul_(1.0 - lr * weight_decay)
+
+                g32 = accumulators[id(p)]
+                grad_sum_sq += g32.norm().item() ** 2
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = torch.zeros((), dtype=torch.float32, device=torch.device("cpu"))
+                    state["exp_avg"] = torch.zeros_like(g32)
+                    state["exp_avg_sq"] = torch.zeros_like(g32)
+
+                state["step"] += 1
+                step = int(state["step"].item())
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+
+                exp_avg.mul_(beta1).add_(g32, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(g32, g32, value=1.0 - beta2)
+
+                bias_c1 = 1.0 - beta1**step
+                bias_c2 = 1.0 - beta2**step
+                step_size_neg = -lr / bias_c1
+                denom = exp_avg_sq.sqrt().div(math.sqrt(bias_c2)).add(adam_eps)
+                update = (exp_avg * step_size_neg / denom).to(dtype=p.dtype)
+                update_sum_sq += update.to(torch.float32).norm().item() ** 2
+                p.data.add_(update)
+
+        scalar_s_abs = abs(scalar / zo_eps)
+        ge = math.sqrt(grad_sum_sq)
+        z_rms = math.sqrt(z_sum_sq) if z_sum_sq > 0.0 else 0.0
+        self._last_metrics["projected_grad_abs"] = abs(scalar)
+        self._last_metrics["scalar_S_abs"] = scalar_s_abs
+        self._last_metrics["grad_est_norm"] = ge
+        self._last_metrics["grad_est_norm_per_z_rms"] = (ge / z_rms) if z_rms > 0.0 else float("nan")
+        self._last_metrics["update_norm"] = math.sqrt(update_sum_sq)
+
 
 class LOZO(ZeroOrderOptimizer):
     def __init__(

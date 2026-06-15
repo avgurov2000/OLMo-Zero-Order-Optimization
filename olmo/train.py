@@ -42,6 +42,7 @@ from .config import (
     SpeedMonitorConfig,
     TrainConfig,
     ZOAdamFOGradCompareConfig,
+    ZoFODirectionConfig,
     ZOProbeConfig,
 )
 from .data import IterableDataset
@@ -266,12 +267,30 @@ class Trainer:
             self._zo_probe = None
 
         compare_cfg: Optional[ZOAdamFOGradCompareConfig] = self.cfg.zo_adam_fo_compare
+        fo_dir_cfg: Optional[ZoFODirectionConfig] = self.cfg.zo_fo_direction
+        if (
+            compare_cfg is not None
+            and compare_cfg.enabled
+            and fo_dir_cfg is not None
+            and fo_dir_cfg.enabled
+        ):
+            raise OLMoConfigurationError(
+                "zo_adam_fo_compare and zo_fo_direction cannot both be enabled; "
+                "use zo_fo_direction for training with cached g_fo probes."
+            )
         if compare_cfg is not None and compare_cfg.enabled and isinstance(self.optim, ZoAdam):
             self._zo_fo_compare: Optional[ZOAdamFOGradCompare] = ZOAdamFOGradCompare(
                 probe_interval=compare_cfg.probe_interval,
             )
         else:
             self._zo_fo_compare = None
+
+        if fo_dir_cfg is not None and fo_dir_cfg.enabled:
+            if not isinstance(self.optim, ZoAdam):
+                raise OLMoConfigurationError("zo_fo_direction requires optimizer.name=zo_adam")
+            self._zo_fo_direction_cache: Optional[dict[int, torch.Tensor]] = None
+        else:
+            self._zo_fo_direction_cache = None
 
         ps: Optional[PhaseSwitchConfig] = self.cfg.phase_switch
         if ps is not None:
@@ -968,6 +987,123 @@ class Trainer:
 
         return ce_batch_loss, z_batch_loss
 
+    def _snapshot_fo_direction(self) -> dict[int, torch.Tensor]:
+        direction: dict[int, torch.Tensor] = {}
+        for group in self.optim.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    if p.grad is None:
+                        raise RuntimeError("FO backward did not populate gradients for zo_fo_direction")
+                    direction[id(p)] = p.grad.detach().float().clone()
+        return direction
+
+    def _train_step_zo_fo_direction(
+        self, batch: Dict[str, Any], reduce_global_loss: bool = True
+    ) -> Dict[str, float]:
+        """ZoAdam with cached ``z = g_fo``, refreshed when ``|S|`` drops below threshold."""
+        assert isinstance(self.optim, ZoAdam)
+        fo_dir = self.cfg.zo_fo_direction
+        assert fo_dir is not None and fo_dir.enabled
+
+        metrics: Dict[str, float] = {}
+
+        if self.indices_file is not None and "index" in batch:
+            indices = "\t".join(str(int(i)) for i in batch["index"])
+            self.indices_file.write(f"{self.global_step}\t{indices}\n")
+
+        if (instance_mask := batch.get("instance_mask")) is not None:
+            metrics["train/masked_instances_local_rank"] = (~instance_mask).sum().item()
+
+        batch = move_to_device(batch, self.device)
+        batch_size_in_tokens = batch["input_ids"].numel()
+        micro_batches = self.split_batch(batch)
+
+        def closure() -> torch.Tensor:
+            total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+            autocast_device = "mps" if self.device.type == "mps" else "cuda"
+            with torch.inference_mode():
+                with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
+                    for micro_batch in micro_batches:
+                        loss, _, _ = self.train_micro_batch(micro_batch, batch_size_in_tokens)
+                        total_loss = total_loss + loss.float()
+            if is_distributed():
+                dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+                total_loss = total_loss / get_world_size()
+            return total_loss
+
+        for group in self.optim.param_groups:
+            group["lr"] = self.scheduler.get_lr(
+                self.cfg.optimizer.learning_rate, self.scheduler_current, self.scheduler_max
+            )
+
+        zo_eps = self.optim.defaults["zo_eps"]
+        threshold = fo_dir.scalar_abs_threshold
+        need_refresh = self._zo_fo_direction_cache is None
+        refresh_attempts = 0
+        backward_passes = 0
+        forced_update = False
+
+        loss: Optional[torch.Tensor] = None
+        while True:
+            if need_refresh:
+                self.optim.zero_grad(set_to_none=True)
+                self.train_batch(batch)
+                backward_passes += 1
+                self._zo_fo_direction_cache = self._snapshot_fo_direction()
+                need_refresh = False
+                refresh_attempts += 1
+
+            assert self._zo_fo_direction_cache is not None
+            loss, raw_scalar = self.optim.estimate_with_direction(closure, self._zo_fo_direction_cache)
+            abs_S = abs(raw_scalar / zo_eps)
+
+            if abs_S >= threshold or refresh_attempts >= fo_dir.max_refresh_retries:
+                if abs_S < threshold:
+                    forced_update = True
+                    log.warning(
+                        "zo_fo_direction: |S|=%.3e below threshold %.3e after %d refresh attempts; "
+                        "applying update anyway.",
+                        abs_S,
+                        threshold,
+                        refresh_attempts,
+                    )
+                self.optim.apply_direction_update(raw_scalar, self._zo_fo_direction_cache)
+                break
+
+            need_refresh = True
+
+        assert loss is not None
+        ce_batch_loss = loss.detach()
+        if ce_batch_loss.device != self.device:
+            ce_batch_loss = ce_batch_loss.to(self.device)
+        if reduce_global_loss:
+            dist.reduce(ce_batch_loss, 0)
+            ce_batch_loss.div_(get_world_size())
+
+        if torch.isnan(ce_batch_loss):
+            raise ValueError("nan loss encountered")
+
+        should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
+        if should_log_optim_metrics_this_step and hasattr(self.optim, "get_post_step_metrics"):
+            optim_metrics = self.optim.get_post_step_metrics(
+                self.dist_model, process_group=self.dist_model.process_group
+            )
+            for key, value in optim_metrics.items():
+                metrics[f"optim/{key}"] = value.item()
+
+        metrics["zo_fo_direction/abs_S"] = abs_S
+        metrics["zo_fo_direction/refresh_attempts"] = float(refresh_attempts)
+        metrics["zo_fo_direction/backward_passes"] = float(backward_passes)
+        metrics["zo_fo_direction/direction_refreshed"] = float(backward_passes > 0)
+        metrics["zo_fo_direction/forced_update"] = float(forced_update)
+
+        self.cur_train_loss = ce_batch_loss.item()
+        self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)
+        metrics["train/CrossEntropyLoss"] = self.cur_train_loss
+        metrics["train/Perplexity"] = math.exp(self.cur_train_loss)
+
+        return metrics
+
     def _train_step_zero_order(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
         """
         MeZO / LOZO: no backward; optimizer step runs 2–3 forward passes via ``closure``.
@@ -1304,6 +1440,12 @@ class Trainer:
             return self._train_step_phase1(batch, reduce_global_loss=reduce_global_loss)
         if self._fo_optim is not None:
             return self._train_step_hybrid(batch, reduce_global_loss=reduce_global_loss)
+        if (
+            isinstance(self.optim, ZoAdam)
+            and self.cfg.zo_fo_direction is not None
+            and self.cfg.zo_fo_direction.enabled
+        ):
+            return self._train_step_zo_fo_direction(batch, reduce_global_loss=reduce_global_loss)
         if isinstance(self.optim, ZeroOrderOptimizer):
             return self._train_step_zero_order(batch, reduce_global_loss=reduce_global_loss)
 
