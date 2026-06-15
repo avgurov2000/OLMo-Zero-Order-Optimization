@@ -818,23 +818,25 @@ class ZoFODirectionConfig(BaseConfig):
     """ZoAdam training with a cached FO gradient direction as the probe vector ``z``.
 
     Each training step:
-    1. If no cached direction or ``|S|`` from the previous probe fell below
-       ``scalar_abs_threshold``, run FO backward and cache ``z = g_fo``.
+    1. If no cached direction or ``|S|`` from the previous probe fell below the dynamic
+       threshold, run FO backward and cache ``z = g_fo``.
     2. Run a two-sided ZO probe along the cached ``z`` to obtain scalar ``S``.
-    3. If ``|S| < scalar_abs_threshold``, refresh ``z`` from a new FO backward (same
-       batch, weights unchanged) and retry, up to ``max_refresh_retries``.
+    3. If ``|S| < threshold``, refresh ``z`` from a new FO backward (same batch, weights
+       unchanged) and retry, up to ``max_refresh_retries``.
     4. Otherwise apply the ZoAdam update along ``z``.
 
-  ``S`` is ``(L(θ+μz) − L(θ−μz)) / (2μ)``; the implementation stores
-  ``(L⁺−L⁻)/2`` internally and divides by ``μ = zo_eps`` when comparing to the
-  threshold.
+    The threshold is set when ``g_fo`` is refreshed:
+    ``threshold = ‖g_fo‖ · scalar_abs_fo_norm_ratio`` and kept until the next refresh.
+
+    ``S`` is ``(L(θ+μz) − L(θ−μz)) / (2μ)``; the implementation stores ``(L⁺−L⁻)/2``
+    internally and divides by ``μ = zo_eps`` when comparing to the threshold.
 
     Only active when the main optimizer is ``zo_adam``.
     """
 
     enabled: bool = True
-    scalar_abs_threshold: float = 1e-6
-    """Minimum ``|S|`` to accept the cached direction without refreshing ``g_fo``."""
+    scalar_abs_fo_norm_ratio: float = 0.1
+    """Dynamic threshold: ``|S|`` must be at least ``‖g_fo‖ · scalar_abs_fo_norm_ratio``."""
 
     max_refresh_retries: int = 10
     """Max FO backward + re-probe attempts per training step before forcing an update."""
@@ -1423,7 +1425,7 @@ class TrainConfig(BaseConfig):
     zo_fo_direction: Optional[ZoFODirectionConfig] = None
     """
     ZoAdam with cached ``z = g_fo`` probe direction, refreshed when ``|S|`` drops below
-    ``scalar_abs_threshold``.  Mutually exclusive with ``zo_adam_fo_compare`` (probe only).
+    ``‖g_fo‖ · scalar_abs_fo_norm_ratio``.  Mutually exclusive with ``zo_adam_fo_compare``.
     """
 
     phase_switch: Optional[PhaseSwitchConfig] = None

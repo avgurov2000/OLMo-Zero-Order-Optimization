@@ -289,8 +289,12 @@ class Trainer:
             if not isinstance(self.optim, ZoAdam):
                 raise OLMoConfigurationError("zo_fo_direction requires optimizer.name=zo_adam")
             self._zo_fo_direction_cache: Optional[dict[int, torch.Tensor]] = None
+            self._zo_fo_direction_norm_fo: Optional[float] = None
+            self._zo_fo_direction_threshold: Optional[float] = None
         else:
             self._zo_fo_direction_cache = None
+            self._zo_fo_direction_norm_fo = None
+            self._zo_fo_direction_threshold = None
 
         ps: Optional[PhaseSwitchConfig] = self.cfg.phase_switch
         if ps is not None:
@@ -997,6 +1001,23 @@ class Trainer:
                     direction[id(p)] = p.grad.detach().float().clone()
         return direction
 
+    @staticmethod
+    def _fo_direction_norm(direction: dict[int, torch.Tensor]) -> float:
+        sq = 0.0
+        for z in direction.values():
+            sq += z.norm().item() ** 2
+        return math.sqrt(sq)
+
+    def _refresh_zo_fo_direction_cache(self, batch: Dict[str, Any]) -> None:
+        fo_dir = self.cfg.zo_fo_direction
+        assert fo_dir is not None
+        self.optim.zero_grad(set_to_none=True)
+        self.train_batch(batch)
+        self._zo_fo_direction_cache = self._snapshot_fo_direction()
+        norm_fo = self._fo_direction_norm(self._zo_fo_direction_cache)
+        self._zo_fo_direction_norm_fo = norm_fo
+        self._zo_fo_direction_threshold = norm_fo * fo_dir.scalar_abs_fo_norm_ratio
+
     def _train_step_zo_fo_direction(
         self, batch: Dict[str, Any], reduce_global_loss: bool = True
     ) -> Dict[str, float]:
@@ -1037,7 +1058,6 @@ class Trainer:
             )
 
         zo_eps = self.optim.defaults["zo_eps"]
-        threshold = fo_dir.scalar_abs_threshold
         need_refresh = self._zo_fo_direction_cache is None
         refresh_attempts = 0
         backward_passes = 0
@@ -1046,14 +1066,14 @@ class Trainer:
         loss: Optional[torch.Tensor] = None
         while True:
             if need_refresh:
-                self.optim.zero_grad(set_to_none=True)
-                self.train_batch(batch)
+                self._refresh_zo_fo_direction_cache(batch)
                 backward_passes += 1
-                self._zo_fo_direction_cache = self._snapshot_fo_direction()
                 need_refresh = False
                 refresh_attempts += 1
 
             assert self._zo_fo_direction_cache is not None
+            assert self._zo_fo_direction_threshold is not None
+            threshold = self._zo_fo_direction_threshold
             loss, raw_scalar = self.optim.estimate_with_direction(closure, self._zo_fo_direction_cache)
             abs_S = abs(raw_scalar / zo_eps)
 
@@ -1092,6 +1112,8 @@ class Trainer:
                 metrics[f"optim/{key}"] = value.item()
 
         metrics["zo_fo_direction/abs_S"] = abs_S
+        metrics["zo_fo_direction/norm_fo"] = self._zo_fo_direction_norm_fo or 0.0
+        metrics["zo_fo_direction/scalar_threshold"] = self._zo_fo_direction_threshold or 0.0
         metrics["zo_fo_direction/refresh_attempts"] = float(refresh_attempts)
         metrics["zo_fo_direction/backward_passes"] = float(backward_passes)
         metrics["zo_fo_direction/direction_refreshed"] = float(backward_passes > 0)

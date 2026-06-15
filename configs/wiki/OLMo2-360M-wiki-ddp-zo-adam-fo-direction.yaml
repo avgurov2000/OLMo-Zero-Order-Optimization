@@ -3,7 +3,7 @@
 # Training loop (zo_fo_direction):
 #   1. FO backward → cache z = g_fo
 #   2. ZO probe along z → scalar S
-#   3. If |S| < scalar_abs_threshold: refresh z from new FO backward (same batch, θ unchanged)
+#   3. If |S| < ‖g_fo‖·scalar_abs_fo_norm_ratio: refresh z from new FO backward
 #   4. If |S| >= threshold: ZoAdam update along cached z; keep z for next step until |S| drops
 #
 # Cost per step: 1–2 FO backward + 2 ZO forwards (two-sided), plus extra retries when |S| is low.
@@ -90,7 +90,7 @@ scheduler:
 
 zo_fo_direction:
   enabled: true
-  scalar_abs_threshold: 1.0e-4
+  scalar_abs_fo_norm_ratio: 0.1
   max_refresh_retries: 10
 
 tokenizer:

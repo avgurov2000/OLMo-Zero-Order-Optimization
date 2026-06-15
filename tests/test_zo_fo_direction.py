@@ -53,5 +53,5 @@ def test_zo_adam_estimate_and_apply_direction_cpu():
 
 def test_zo_fo_direction_config_loads():
     cfg = TrainConfig()
-    cfg.zo_fo_direction = ZoFODirectionConfig(enabled=True, scalar_abs_threshold=1e-4)
-    assert cfg.zo_fo_direction.scalar_abs_threshold == 1e-4
+    cfg.zo_fo_direction = ZoFODirectionConfig(enabled=True, scalar_abs_fo_norm_ratio=0.1)
+    assert cfg.zo_fo_direction.scalar_abs_fo_norm_ratio == 0.1
