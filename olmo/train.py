@@ -70,6 +70,8 @@ from .zo_optim import ZeroOrderOptimizer, ZoAdam
 from .zo_fo_direction_strategy import (
     ZoFODirectionRuntime,
     build_zo_fo_direction_strategy,
+    fo_direction_global_norm,
+    normalize_fo_direction,
 )
 from .zo_probe import ZOAdamFOGradCompare, ZODivergenceProbe, register_zo_fo_compare_wandb_metrics
 from .util import upload
@@ -1005,16 +1007,20 @@ class Trainer:
 
     @staticmethod
     def _fo_direction_norm(direction: dict[int, torch.Tensor]) -> float:
-        sq = 0.0
-        for z in direction.values():
-            sq += z.norm().item() ** 2
-        return math.sqrt(sq)
+        return fo_direction_global_norm(direction)
 
     def _refresh_zo_fo_direction_cache(self, batch: Dict[str, Any]) -> float:
         self.optim.zero_grad(set_to_none=True)
         self.train_batch(batch)
-        self._zo_fo_direction_runtime.cache = self._snapshot_fo_direction()
-        return self._fo_direction_norm(self._zo_fo_direction_runtime.cache)
+        raw = self._snapshot_fo_direction()
+        norm_fo = self._fo_direction_norm(raw)
+        fo_dir = self.cfg.zo_fo_direction
+        assert fo_dir is not None
+        if fo_dir.normalize_direction:
+            self._zo_fo_direction_runtime.cache, _ = normalize_fo_direction(raw)
+        else:
+            self._zo_fo_direction_runtime.cache = raw
+        return norm_fo
 
     def _train_step_zo_fo_direction(
         self, batch: Dict[str, Any], reduce_global_loss: bool = True
@@ -1113,6 +1119,10 @@ class Trainer:
 
         metrics["zo_fo_direction/abs_S"] = abs_S
         metrics["zo_fo_direction/norm_fo"] = runtime.norm_fo or 0.0
+        metrics["zo_fo_direction/norm_z"] = (
+            self._fo_direction_norm(runtime.cache) if runtime.cache is not None else 0.0
+        )
+        metrics["zo_fo_direction/normalize_direction"] = float(fo_dir.normalize_direction)
         metrics["zo_fo_direction/scalar_threshold"] = (
             runtime.scalar_threshold if runtime.scalar_threshold is not None else 0.0
         )

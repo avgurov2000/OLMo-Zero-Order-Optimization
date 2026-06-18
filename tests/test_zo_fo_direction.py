@@ -62,11 +62,13 @@ def test_zo_fo_direction_config_loads():
     cfg = TrainConfig()
     cfg.zo_fo_direction = ZoFODirectionConfig(
         enabled=True,
+        normalize_direction=True,
         sampling_strategy=ZoFOSamplingStrategyConfig(
             strategy_type="fo_direction_norm_thrs",
             scalar_abs_fo_norm_ratio=0.1,
         ),
     )
+    assert cfg.zo_fo_direction.normalize_direction is True
     assert cfg.zo_fo_direction.sampling_strategy.scalar_abs_fo_norm_ratio == 0.1
 
 

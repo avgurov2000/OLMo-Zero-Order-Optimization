@@ -10,6 +10,8 @@ from olmo.zo_fo_direction_strategy import (
     FoDirectionScalarThrsStrategy,
     ZoFODirectionRuntime,
     build_zo_fo_direction_strategy,
+    fo_direction_global_norm,
+    normalize_fo_direction,
 )
 
 
@@ -77,3 +79,15 @@ def test_interval_refreshes_every_n_steps():
 
     apply, forced = strategy.should_apply_update(0.0, runtime, 1, 10)
     assert apply and not forced
+
+
+def test_normalize_fo_direction_unit_norm():
+    import torch
+
+    direction = {0: torch.tensor([3.0, 4.0]), 1: torch.tensor([0.0, 0.0])}
+    assert fo_direction_global_norm(direction) == pytest.approx(5.0)
+
+    normalized, norm = normalize_fo_direction(direction)
+    assert norm == pytest.approx(5.0)
+    assert fo_direction_global_norm(normalized) == pytest.approx(1.0)
+    assert normalized[0] == pytest.approx(torch.tensor([0.6, 0.8]))

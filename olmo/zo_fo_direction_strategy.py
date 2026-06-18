@@ -1,6 +1,7 @@
 """Pluggable refresh policies for ZoAdam training with ``z = g_fo``."""
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
@@ -10,6 +11,23 @@ from .exceptions import OLMoConfigurationError
 
 if TYPE_CHECKING:
     import torch
+
+
+def fo_direction_global_norm(direction: dict[int, "torch.Tensor"]) -> float:
+    sq = 0.0
+    for z in direction.values():
+        sq += z.norm().item() ** 2
+    return math.sqrt(sq)
+
+
+def normalize_fo_direction(
+    direction: dict[int, "torch.Tensor"],
+) -> tuple[dict[int, "torch.Tensor"], float]:
+    """Return ``(direction / ‖direction‖, ‖direction‖)``; identity if norm is zero."""
+    norm = fo_direction_global_norm(direction)
+    if norm > 0.0:
+        return {pid: z / norm for pid, z in direction.items()}, norm
+    return direction, norm
 
 
 @dataclass

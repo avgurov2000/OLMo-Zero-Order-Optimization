@@ -1,7 +1,7 @@
 # OLMo2-360M — ZoAdam with cached FO direction as probe vector z.
 #
 # Training loop (zo_fo_direction):
-#   1. FO backward → cache z = g_fo
+#   1. FO backward → cache z = g_fo (or z = g_fo / ‖g_fo‖ if normalize_direction: true)
 #   2. ZO probe along z → scalar S
 #   3. If |S| < ‖g_fo‖·scalar_abs_fo_norm_ratio: refresh z from new FO backward
 #   4. If |S| >= threshold: ZoAdam update along cached z; keep z for next step until |S| drops
@@ -91,6 +91,7 @@ scheduler:
 zo_fo_direction:
   enabled: true
   max_refresh_retries: 10
+  normalize_direction: false
   sampling_strategy:
     strategy_type: fo_direction_norm_thrs
     scalar_abs_fo_norm_ratio: 0.1

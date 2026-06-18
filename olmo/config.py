@@ -843,6 +843,9 @@ class ZoFODirectionConfig(BaseConfig):
     max_refresh_retries: int = 10
     """Max FO backward + re-probe attempts per training step before forcing an update."""
 
+    normalize_direction: bool = False
+    """If true, use ``z = g_fo / ‖g_fo‖`` instead of raw ``z = g_fo`` for ZO probes and updates."""
+
     sampling_strategy: ZoFOSamplingStrategyConfig = field(default_factory=ZoFOSamplingStrategyConfig)
 
     @classmethod
