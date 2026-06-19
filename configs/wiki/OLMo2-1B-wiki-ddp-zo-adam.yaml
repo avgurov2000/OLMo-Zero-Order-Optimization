@@ -80,6 +80,7 @@ optimizer:
   zo_eps: 1.0e-3
   zo_perturbation_mode: two_side
   mezo_vector_sampling_type: standard_normal
+  zo_normalize_direction: false
 
 scheduler:
   name: cosine_with_warmup

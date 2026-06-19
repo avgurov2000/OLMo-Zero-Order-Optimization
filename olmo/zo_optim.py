@@ -18,6 +18,8 @@ import numpy as np
 import torch
 from torch.optim import Optimizer
 
+from .zo_fo_direction_strategy import normalize_fo_direction
+
 
 class ZeroOrderOptimizer(Optimizer):
     """Marker base class; the trainer uses this to skip backward and gradient clipping."""
@@ -230,6 +232,7 @@ class ZoAdam(ZeroOrderOptimizer):
         weight_decay: float = 0.0,
         vector_sampling_type: str = "standard_normal",
         num_pert_samples: int = 1,
+        normalize_direction: bool = False,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -254,6 +257,7 @@ class ZoAdam(ZeroOrderOptimizer):
         )
         super().__init__(params, defaults)
         self.vector_sampler = VectorSampler(vector_sampling_type)
+        self.normalize_direction = normalize_direction
         self._generators: dict[torch.device, torch.Generator] = {}
         self._last_metrics: dict[str, float] = {}
         self._last_pert_samples: list[tuple[int, float]] = []
@@ -328,16 +332,28 @@ class ZoAdam(ZeroOrderOptimizer):
         self._last_metrics["projected_grad_abs"] = sum(abs(s) for _, s in samples) / num_pert
         return first_loss  # type: ignore[return-value]
 
-    def _perturb(self, z_seed: int, scaling_factor: float) -> None:
+    def _sample_probe_direction(self, z_seed: int) -> dict[int, torch.Tensor]:
+        """Sample per-parameter ``z`` for ``z_seed``; optionally normalize globally."""
         self._reset_generators(z_seed)
+        direction: dict[int, torch.Tensor] = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                gen = self._get_generator(p.device)
+                direction[id(p)] = self.vector_sampler.sample(p.shape, p.device, gen)
+        if self.normalize_direction:
+            direction, _ = normalize_fo_direction(direction)
+        return direction
+
+    def _perturb(self, z_seed: int, scaling_factor: float) -> None:
+        direction = self._sample_probe_direction(z_seed)
         for group in self.param_groups:
             zo_eps = group["zo_eps"]
             for p in group["params"]:
                 if not p.requires_grad:
                     continue
-                gen = self._get_generator(p.device)
-                z = self.vector_sampler.sample(p.shape, p.device, gen)
-                p.data.add_(z, alpha=scaling_factor * zo_eps)
+                p.data.add_(direction[id(p)], alpha=scaling_factor * zo_eps)
 
     def _apply_update(self, samples: list[tuple[int, float]]) -> None:
         n = len(samples)
@@ -351,16 +367,15 @@ class ZoAdam(ZeroOrderOptimizer):
 
         z_sum_sq = 0.0
         for seed_i, scalar_i in samples:
-            self._reset_generators(seed_i)
+            direction = self._sample_probe_direction(seed_i)
             for group in self.param_groups:
                 zo_eps = group["zo_eps"]
                 for p in group["params"]:
                     if not p.requires_grad:
                         continue
-                    gen = self._get_generator(p.device)
-                    z = self.vector_sampler.sample(p.shape, p.device, gen)
-                    z_sum_sq += z.float().norm().item() ** 2
-                    accumulators[id(p)].add_(z.float(), alpha=scalar_i / zo_eps)
+                    z = direction[id(p)].float()
+                    z_sum_sq += z.norm().item() ** 2
+                    accumulators[id(p)].add_(z, alpha=scalar_i / zo_eps)
 
         grad_sum_sq = 0.0
         update_sum_sq = 0.0

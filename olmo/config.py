@@ -581,6 +581,9 @@ class OptimizerConfig(BaseConfig):
     mezo_vector_sampling_type: str = "standard_normal"
     """MeZO / ZoAdam / LDSD: ``standard_normal`` or ``lp_sphere`` for the probing direction ``z``."""
 
+    zo_normalize_direction: bool = False
+    """ZoAdam: if true, divide the sampled probe ``z`` by its global L2 norm before SPSA."""
+
     mezo_num_pert_samples: int = 1
     """MeZO: number of antithetic perturbation pairs per step.
     1 → single pair (2 forward passes).

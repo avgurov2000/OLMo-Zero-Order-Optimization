@@ -1040,6 +1040,7 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             weight_decay=cfg.optimizer.weight_decay,
             vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
             num_pert_samples=cfg.optimizer.mezo_num_pert_samples,
+            normalize_direction=cfg.optimizer.zo_normalize_direction,
         )
     elif cfg.optimizer.name == OptimizerType.zo_muon:
         from .zo_optim import ZOMuon

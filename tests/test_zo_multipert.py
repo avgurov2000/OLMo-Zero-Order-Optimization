@@ -227,3 +227,33 @@ def test_lozo_gradient_average_1d(n):
     torch.testing.assert_close(
         p_after_opt, theta - lr * expected_z_acc.to(theta.dtype), atol=1.2e-4, rtol=1e-5
     )
+
+
+def test_zo_adam_normalize_direction_unit_norm():
+    from olmo.zo_fo_direction_strategy import fo_direction_global_norm
+
+    p1 = _param([0.5, 1.5])
+    p2 = _param([[1.0, 2.0], [3.0, 4.0]])
+    opt = ZoAdam(
+        [p1, p2],
+        lr=0.0,
+        zo_eps=1e-3,
+        normalize_direction=True,
+        num_pert_samples=1,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
+    direction = opt._sample_probe_direction(12345)
+    assert fo_direction_global_norm(direction) == pytest.approx(1.0)
+
+    opt_raw = ZoAdam(
+        [p1, p2],
+        lr=0.0,
+        zo_eps=1e-3,
+        normalize_direction=False,
+        num_pert_samples=1,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
+    raw = opt_raw._sample_probe_direction(12345)
+    assert fo_direction_global_norm(raw) > 1.0

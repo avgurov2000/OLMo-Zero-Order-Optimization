@@ -86,6 +86,7 @@ optimizer:
   zo_eps: 1.0e-3
   zo_perturbation_mode: two_side
   mezo_vector_sampling_type: standard_normal
+  zo_normalize_direction: false
   mezo_num_pert_samples: 5   # 5 антитетических пар → 10 forward-проходов на шаг
 
 scheduler:
