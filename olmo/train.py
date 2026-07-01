@@ -65,7 +65,7 @@ from .torch_util import (
     synchronize_flag,
     synchronize_value,
 )
-from .ldsd_optim import LDSDMuon
+from .ldsd_optim import LDSDMuon, LDSDRl, LDSDRlAdaMM, LDSDRlSgd
 from .zo_optim import ZeroOrderOptimizer, ZoAdam
 from .zo_fo_direction_strategy import (
     ZoFODirectionRuntime,
@@ -290,6 +290,10 @@ class Trainer:
             )
         else:
             self._zo_fo_compare = None
+
+        # LDSDRl / LDSDRlAdaMM / LDSDRlSgd: μ_0-from-FO-gradient init runs once, on the
+        # first zero-order training step (see `_train_step_zero_order`).
+        self._ldsd_rl_mu_fo_initialized = False
 
         if fo_dir_cfg is not None and fo_dir_cfg.enabled:
             if not isinstance(self.optim, ZoAdam):
@@ -1167,8 +1171,24 @@ class Trainer:
         run_fo_compare = (
             self._zo_fo_compare is not None and self._zo_fo_compare.should_run(self.global_step)
         )
-        if run_fo_compare:
+        should_init_mu_from_fo = (
+            self.cfg.optimizer.ldsd_rl_mu_init_from_fo
+            and isinstance(self.optim, (LDSDRl, LDSDRlAdaMM, LDSDRlSgd))
+            and not self._ldsd_rl_mu_fo_initialized
+            # global_step is incremented before train_step() is called, so `1` is the very
+            # first batch of a fresh run; guards against clobbering μ on checkpoint resume.
+            and self.global_step == 1
+        )
+        if run_fo_compare or should_init_mu_from_fo:
             self.train_batch(batch)
+        if should_init_mu_from_fo:
+            fo_init_metrics = self.optim.init_mu_from_fo_grad(
+                normalize=self.cfg.optimizer.ldsd_rl_mu_init_normalize
+            )
+            metrics["train/ldsd_rl_mu_fo_init_norm"] = fo_init_metrics["fo_grad_norm"]
+            self._ldsd_rl_mu_fo_initialized = True
+            if not run_fo_compare:
+                self.optim.zero_grad(set_to_none=True)
 
         z_seed: Optional[int] = None
         if is_distributed():

@@ -612,6 +612,16 @@ class OptimizerConfig(BaseConfig):
     ldsd_rl_sgd_momentum: float = 0.9
     """LDSDRlSgd: SGD momentum coefficient (0.0 = vanilla SGD without momentum)."""
 
+    ldsd_rl_mu_init_from_fo: bool = False
+    """LDSDRl / LDSDRlAdaMM / LDSDRlSgd: if true, seed μ_0 from a real first-order gradient
+    (one FO backward pass on the first training batch) instead of the algorithm's default
+    random-unit-vector (LDSDRl) or zero (LDSDRlAdaMM / LDSDRlSgd) initialization."""
+
+    ldsd_rl_mu_init_normalize: bool = False
+    """LDSDRl / LDSDRlAdaMM / LDSDRlSgd: only used when ``ldsd_rl_mu_init_from_fo=True``.
+    If true, L2-normalize the FO gradient (global norm across all trainable params) before
+    assigning it to μ_0; if false, use the raw FO gradient."""
+
     def __post_init__(self):
         self.betas = tuple(self.betas)  # type: ignore[assignment]
 

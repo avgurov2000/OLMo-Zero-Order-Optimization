@@ -377,10 +377,52 @@ class LDSDSignSgd(ZeroOrderOptimizer):
 
 
 # ---------------------------------------------------------------------------
+# Shared μ_0-from-FO-gradient init (LDSDRl / LDSDRlAdaMM / LDSDRlSgd)
+# ---------------------------------------------------------------------------
+
+class _MuFromFoGradMixin:
+    """Seed the per-parameter trust direction μ from a true first-order gradient.
+
+    Requires a prior FO backward pass so every trainable parameter's ``.grad``
+    is populated (e.g. via ``Trainer.train_batch``). Overwrites ``state["mu"]``
+    (and ``state["mu_old"]`` / ``state["mu_old_norm_sq"]``) in place, so it must
+    be called before the first ``step()``.
+    """
+
+    def init_mu_from_fo_grad(self, normalize: bool = False) -> dict[str, float]:
+        grads: dict[int, torch.Tensor] = {}
+        for group in self.param_groups:  # type: ignore[attr-defined]
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                if p.grad is None:
+                    raise RuntimeError(
+                        "init_mu_from_fo_grad requires a populated .grad on every trainable "
+                        "parameter; run a first-order backward pass first."
+                    )
+                grads[id(p)] = p.grad.detach().float()
+
+        fo_norm = math.sqrt(sum(g.norm().item() ** 2 for g in grads.values()))
+        scale = 1.0 / fo_norm if (normalize and fo_norm > 0) else 1.0
+
+        for group in self.param_groups:  # type: ignore[attr-defined]
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                state = self.state[p]  # type: ignore[attr-defined]
+                mu = state["mu"]
+                mu.copy_((grads[id(p)] * scale).to(mu.dtype))
+                state["mu_old"].copy_(mu)
+                state["mu_old_norm_sq"] = mu.float().norm().item() ** 2
+
+        return {"fo_grad_norm": fo_norm, "normalized": float(normalize)}
+
+
+# ---------------------------------------------------------------------------
 # LDSDRl
 # ---------------------------------------------------------------------------
 
-class LDSDRl(ZeroOrderOptimizer):
+class LDSDRl(_MuFromFoGradMixin, ZeroOrderOptimizer):
     """ZO_RL from ZO-LDSD, adapted to OLMo's interface.
 
     Explores k random perturbation directions per step, selects the seed that
@@ -616,7 +658,7 @@ class LDSDRl(ZeroOrderOptimizer):
 # LDSDRlAdaMM
 # ---------------------------------------------------------------------------
 
-class LDSDRlAdaMM(ZeroOrderOptimizer):
+class LDSDRlAdaMM(_MuFromFoGradMixin, ZeroOrderOptimizer):
     """ZO_RL_AdaMM from ZO-LDSD, adapted to OLMo's interface.
 
     Combines RL-based direction learning (same k-candidate exploration as
@@ -839,7 +881,7 @@ class LDSDRlAdaMM(ZeroOrderOptimizer):
 # LDSDRlSgd
 # ---------------------------------------------------------------------------
 
-class LDSDRlSgd(ZeroOrderOptimizer):
+class LDSDRlSgd(_MuFromFoGradMixin, ZeroOrderOptimizer):
     """ZO_RL_SGD from ZO-LDSD adapted to OLMo's interface.
 
     RL-based direction learning (k-candidate exploration, same as LDSDRlAdaMM)
