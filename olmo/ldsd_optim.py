@@ -1090,3 +1090,398 @@ class LDSDRlSgd(_MuFromFoGradMixin, ZeroOrderOptimizer):
                 z = torch.normal(mean=mu, std=self.variance, generator=pgen)
                 # mu is bf16; cast z to param dtype (fp32 in amp_bf16) for in-place add.
                 p.data.add_(z.to(p.data.dtype), alpha=scaling_factor * zo_eps)
+
+
+# ---------------------------------------------------------------------------
+# LDSDRlKron
+# ---------------------------------------------------------------------------
+
+class LDSDRlKron(_MuFromFoGradMixin, ZeroOrderOptimizer):
+    """ZO-RL's learned N(μ, σ²) policy wrapped in KronZO's directional selection.
+
+    This combines two optimizers:
+
+      * **Perturbation sampler (ZO-RL).** Directions are drawn ``z ~ N(μ, σ²)``
+        where μ is a per-parameter "trust direction" learned online. This is
+        KronZO Algorithm 2's Line 9 (``Z_i = A_i ⊗ B``) replaced by the ZO-RL
+        sampler.
+      * **Direction selection + acceptance (KronZO, Lines 8-19).** Each step
+        samples ``q`` probes; for each it forms the SPSA scalar
+        ``c_i = (L(θ+εz_i) − L(θ−εz_i)) / 2ε`` and *evaluates the candidate step*
+        ``L(θ − α c_i z_i)``. Only the single best-decreasing direction is kept,
+        and it is applied only if its loss beats the worst of the last ``h``
+        accepted losses (sliding window); otherwise the step is skipped. Cost:
+        ``1 + 3q`` forward passes (two_side) or ``1 + 2q`` (one_side).
+
+    The μ direction is still learned with ZO-RL's ES / score-function update
+    (Phase 4), **unchanged** — it is fed by the ``q`` probe returns ``f_i``
+    (perturbed loss ``L(θ+εz_i)`` by default, or the candidate loss).
+
+    Configurable via ``apply`` (how θ consumes the chosen direction: ``kron`` /
+    ``sign_sgd`` / ``sgd`` / ``adamm``), ``mu_return`` (``perturbed`` / ``candidate``)
+    and ``mu_init`` (``zero`` / ``random``; FO-gradient init is orthogonal, via the
+    trainer's ``ldsd_rl_mu_init_from_fo`` path — this class subclasses the same
+    ``_MuFromFoGradMixin``).
+
+    A single active subset of parameters (``params_ratio``) is chosen per step
+    from ``z_seed`` and shared by all ``q`` probes, the θ update and the μ update,
+    so the ES gradient stays well-defined. ``params_ratio=1.0`` gives the dense,
+    KronZO-like regime.
+
+    DDP: all ranks receive the same ``z_seed`` (synced by the trainer), so they
+    agree on the subset, the ``q`` candidate seeds, every loss (the closure
+    all-reduces), the accept/skip decision and the update, with no gradient
+    communication. FSDP is not supported (blocked in ``build_optimizer``).
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        zo_eps: float = 1e-3,
+        query_budget: int = 10,
+        history_length: int = 10,
+        variance: float = 1e-3,
+        beta: float = 0.9,
+        betas: tuple[float, float] = (0.9, 0.999),
+        momentum: float = 0.0,
+        lr_mu: Optional[float] = None,
+        params_ratio: float = 1.0,
+        perturbation_mode: str = "two_side",
+        weight_decay: float = 0.0,
+        apply: str = "kron",
+        mu_return: str = "perturbed",
+        mu_init: str = "zero",
+    ):
+        if lr < 0:
+            raise ValueError(f"Invalid lr: {lr}")
+        if zo_eps <= 0:
+            raise ValueError(f"Invalid zo_eps: {zo_eps}")
+        if query_budget < 1:
+            raise ValueError(f"query_budget must be >= 1, got {query_budget}")
+        if history_length < 0:
+            raise ValueError(f"history_length must be >= 0, got {history_length}")
+        if not (0.0 < params_ratio <= 1.0):
+            raise ValueError(f"params_ratio must be in (0, 1], got {params_ratio}")
+        if perturbation_mode not in ("two_side", "one_side"):
+            raise ValueError("perturbation_mode must be 'two_side' or 'one_side'")
+        if apply not in ("kron", "sign_sgd", "sgd", "adamm"):
+            raise ValueError(f"apply must be kron|sign_sgd|sgd|adamm, got {apply!r}")
+        if mu_return not in ("perturbed", "candidate"):
+            raise ValueError(f"mu_return must be 'perturbed' or 'candidate', got {mu_return!r}")
+        if mu_init not in ("zero", "random"):
+            raise ValueError(f"mu_init must be 'zero' or 'random', got {mu_init!r}")
+
+        defaults = dict(
+            lr=lr,
+            zo_eps=zo_eps,
+            weight_decay=weight_decay,
+            beta=beta,
+            betas=betas,
+            momentum=momentum,
+            # Exposed so Trainer._zo_forward_passes_per_step accounts for 1 + (3|2)q.
+            query_budget=query_budget,
+            perturbation_mode=perturbation_mode,
+        )
+        super().__init__(params, defaults)
+        self.q = query_budget
+        self.variance = variance
+        self.lr_mu = lr_mu if lr_mu is not None else lr
+        self.params_ratio = params_ratio
+        self._perturbation_mode = perturbation_mode
+        self._apply = apply
+        self._mu_return = mu_return
+        self._generators: dict[torch.device, torch.Generator] = {}
+        self._last_metrics: dict[str, float] = {}
+
+        self._window: list[float] = [float("inf")] * history_length
+        self._step_count = 0
+        self._n_steps = 0
+        self._n_accepted = 0
+
+        self._all_trainable = [
+            p for g in self.param_groups for p in g["params"] if p.requires_grad
+        ]
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                state = self.state[p]
+                state["step"] = 0
+                if mu_init == "random":
+                    mu = torch.randn_like(p, memory_format=torch.preserve_format)
+                    norm = torch.linalg.norm(mu)
+                    mu = mu.div_(norm) if norm > 0 else mu
+                else:  # "zero"
+                    mu = torch.zeros_like(p, memory_format=torch.preserve_format)
+                state["mu"] = mu
+                state["mu_old"] = mu.detach().clone()
+                state["mu_old_norm_sq"] = mu.float().norm().item() ** 2
+                # apply-mode-specific buffers (allocated only when needed).
+                if apply == "sign_sgd":
+                    state["grad_accum"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                elif apply == "adamm":
+                    _bf16 = torch.bfloat16
+                    state["exp_avg"] = torch.zeros_like(p, dtype=_bf16, memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=_bf16, memory_format=torch.preserve_format)
+                    state["max_exp_avg_sq"] = torch.zeros_like(p, dtype=_bf16, memory_format=torch.preserve_format)
+                # "sgd" momentum_buffer is created lazily on first use; "kron" needs no buffer.
+
+    # ------------------------------------------------------------------
+    def _get_generator(self, device: torch.device) -> torch.Generator:
+        if device not in self._generators:
+            self._generators[device] = torch.Generator(device=device)
+        return self._generators[device]
+
+    def get_post_step_metrics(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+        """KronZO/ZO-RL diagnostics from the last step.
+
+        projected_grad_abs   mean |c_i| over the q probes (SPSA signal strength).
+        grad_est_norm        ‖applied update direction‖ (0.0 when the step was skipped).
+        update_accepted      1.0 if the directional step was applied this step, else 0.0.
+        accept_rate          running fraction of accepted steps.
+        avg_mu_norm          mean ‖μ‖ over trainable params.
+        avg_mu_grad_norm     mean per-param ‖g_μ‖ this step.
+        avg_mu_norm_diff     mean per-param ‖μ − μ_old‖ this step.
+        """
+        return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
+
+    # ------------------------------------------------------------------
+    # Subset selection and perturbation helpers
+    # ------------------------------------------------------------------
+    def _select_ids(self, seed: int) -> set[int]:
+        """Deterministically pick the active parameter subset for this step."""
+        if self.params_ratio >= 1.0:
+            return {id(p) for p in self._all_trainable}
+        ref_device = self._all_trainable[0].device
+        gen = self._get_generator(ref_device)
+        gen.manual_seed(seed)
+        n = max(1, int(len(self._all_trainable) * self.params_ratio))
+        perm = torch.randperm(len(self._all_trainable), device=ref_device, generator=gen)[:n]
+        return {id(self._all_trainable[int(i)]) for i in perm}
+
+    def _z(self, p: torch.Tensor, seed: int) -> torch.Tensor:
+        """Regenerate the ZO-RL probe direction z ~ N(μ, σ²) for one param from seed.
+
+        Reseeds per parameter (faithful to ZO_RL); μ is frozen within the step so
+        every regeneration point (probe, candidate, apply, μ-update) agrees.
+        """
+        mu = self.state[p]["mu"]
+        gen = self._get_generator(p.device)
+        gen.manual_seed(seed)
+        return torch.normal(mean=mu, std=self.variance, generator=gen)
+
+    def _apply_eps(self, seed: int, ids: set[int], sign: float) -> None:
+        """θ += sign · ε · z   (finite-difference probe; single global ε like KronZO)."""
+        eps = self.defaults["zo_eps"]
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad or id(p) not in ids:
+                    continue
+                z = self._z(p, seed)
+                p.data.add_(z.to(p.data.dtype), alpha=sign * eps)
+
+    def _apply_step(self, seed: int, ids: set[int], c: float, sign: float) -> None:
+        """θ += sign · lr · c · z   (candidate / trial step, per-group lr)."""
+        for group in self.param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                if not p.requires_grad or id(p) not in ids:
+                    continue
+                z = self._z(p, seed)
+                p.data.add_(z.to(p.data.dtype), alpha=sign * lr * c)
+
+    def _push_window(self, loss: float) -> None:
+        """Replace the worst (max) loss in the acceptance window with ``loss``."""
+        if not self._window:
+            return
+        j = max(range(len(self._window)), key=lambda k: self._window[k])
+        self._window[j] = loss
+
+    # ------------------------------------------------------------------
+    # Parameter update (once the best direction is chosen)
+    # ------------------------------------------------------------------
+    def _apply_update(self, seed: int, c: float, ids: set[int]) -> float:
+        """Consume the chosen direction ``grad = c · z`` per the ``apply`` mode.
+
+        Returns the L2 norm of the raw ZO update direction ``c · z`` (before the
+        apply-mode transform), summed over the active subset.
+        """
+        grad_sq = 0.0
+        for group in self.param_groups:
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+            for p in group["params"]:
+                if not p.requires_grad or id(p) not in ids:
+                    continue
+                state = self.state[p]
+                state["step"] += 1
+                z = self._z(p, seed)
+                grad = z.mul(c)  # ZO-RL gradient estimate: z · (projected_grad/ε) = z · c
+                grad_sq += grad.float().norm().item() ** 2
+                p_dtype = p.data.dtype
+
+                if weight_decay != 0.0:
+                    p.data.mul_(1.0 - lr * weight_decay)
+
+                if self._apply == "kron":
+                    p.data.add_(grad.to(p_dtype), alpha=-lr)
+                elif self._apply == "sign_sgd":
+                    beta = group["beta"]
+                    buf = state["grad_accum"]
+                    buf.mul_(beta).add_(grad, alpha=1.0 - beta)
+                    p.data.add_(torch.sign(buf).to(p_dtype), alpha=-lr)
+                elif self._apply == "sgd":
+                    mom = group["momentum"]
+                    if mom != 0.0:
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(
+                                p, memory_format=torch.preserve_format
+                            )
+                        buf = state["momentum_buffer"]
+                        buf.mul_(mom).add_(grad)
+                        p.data.add_(buf.to(p_dtype), alpha=-lr)
+                    else:
+                        p.data.add_(grad.to(p_dtype), alpha=-lr)
+                elif self._apply == "adamm":
+                    beta1, beta2 = group["betas"]
+                    state["exp_avg"].mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                    state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                    torch.maximum(state["max_exp_avg_sq"], state["exp_avg_sq"], out=state["max_exp_avg_sq"])
+                    p.data.addcdiv_(
+                        state["exp_avg"].to(p_dtype),
+                        (state["max_exp_avg_sq"].sqrt() + 1e-10).to(p_dtype),
+                        value=-lr,
+                    )
+        return math.sqrt(max(grad_sq, 0.0))
+
+    # ------------------------------------------------------------------
+    # μ update (ES / score-function natural gradient) — unchanged from ZO-RL
+    # ------------------------------------------------------------------
+    def _mu_update(self, candidate_seeds: list[int], returns: list[float], ids: set[int]) -> None:
+        q = len(candidate_seeds)
+        f_vals = torch.tensor(returns)
+        coeff = (f_vals * q - f_vals.sum()) / max(q - 1, 1)
+
+        dot_sum = 0.0
+        new_norm_sq = 0.0
+        old_norm_sq = 0.0
+        mu_norm_diff_sq = 0.0
+        mu_grad_norm_sq = 0.0
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad or id(p) not in ids:
+                    continue
+                state = self.state[p]
+                mu = state["mu"]
+                mu_diff = torch.zeros_like(mu)
+                for i, seed in enumerate(candidate_seeds):
+                    gen = self._get_generator(p.device)
+                    gen.manual_seed(seed)
+                    z_i = torch.normal(mean=mu, std=self.variance, generator=gen)
+                    mu_diff.add_(mu - z_i, alpha=coeff[i].item())
+
+                g_mu = mu_diff.neg_().div_(q * self.variance ** 2)
+                state["mu"].add_(g_mu, alpha=-self.lr_mu)
+
+                dot_sum += torch.dot(state["mu_old"].view(-1).float(), state["mu"].view(-1).float()).item()
+                new_norm_sq += state["mu"].float().norm().item() ** 2
+                old_norm_sq += state["mu_old_norm_sq"]
+                mu_norm_diff_sq += (state["mu"] - state["mu_old"]).float().norm().item() ** 2
+                mu_grad_norm_sq += g_mu.float().norm().item() ** 2
+
+                state["mu_old"].copy_(state["mu"])
+                state["mu_old_norm_sq"] = state["mu"].float().norm().item() ** 2
+
+        n = max(len(self._all_trainable), 1)
+        self._last_metrics["avg_mu_norm"] = (
+            sum(self.state[p]["mu"].float().norm().item() for p in self._all_trainable) / n
+        )
+        self._last_metrics["avg_mu_norm_diff"] = math.sqrt(max(mu_norm_diff_sq, 0.0)) / n
+        self._last_metrics["avg_mu_grad_norm"] = math.sqrt(max(mu_grad_norm_sq, 0.0)) / n
+        if new_norm_sq > 0 and old_norm_sq > 0:
+            self._last_metrics["mu_alignment"] = dot_sum / (
+                math.sqrt(new_norm_sq) * math.sqrt(old_norm_sq)
+            )
+
+    # ------------------------------------------------------------------
+    # Step
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def step(
+        self,
+        closure: Callable[[], torch.Tensor],
+        z_seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        if z_seed is None:
+            z_seed = int(np.random.randint(0, 1_000_000_000))
+
+        q = self.q
+        eps = self.defaults["zo_eps"]
+        two_side = self._perturbation_mode == "two_side"
+
+        # One active subset per step, shared by all probes / updates.
+        ids = self._select_ids(z_seed)
+        seed_rng = np.random.RandomState(z_seed)
+        candidate_seeds = [int(seed_rng.randint(0, 1_000_000_000)) for _ in range(q)]
+
+        # KronZO Line 5: centre loss at θ_k (also reported to the trainer).
+        center_loss = closure()
+        center = center_loss.item()
+        l_best = center
+        best_seed: Optional[int] = None
+        best_c: Optional[float] = None
+        abs_c_sum = 0.0
+        returns: list[float] = []
+
+        for seed_i in candidate_seeds:
+            # SPSA scalar c_i along z_i.
+            self._apply_eps(seed_i, ids, +1.0)
+            loss_plus = closure().item()
+            if two_side:
+                self._apply_eps(seed_i, ids, -2.0)
+                loss_minus = closure().item()
+                self._apply_eps(seed_i, ids, +1.0)  # restore θ
+                projected_grad = (loss_plus - loss_minus) / 2.0
+            else:
+                self._apply_eps(seed_i, ids, -1.0)  # restore θ
+                projected_grad = loss_plus - center
+            c_i = projected_grad / eps
+            abs_c_sum += abs(c_i)
+
+            # Evaluate the candidate step L(θ − lr·c_i·z_i), then restore.
+            self._apply_step(seed_i, ids, c_i, -1.0)
+            loss_cand = closure().item()
+            self._apply_step(seed_i, ids, c_i, +1.0)
+
+            returns.append(loss_cand if self._mu_return == "candidate" else loss_plus)
+
+            if loss_cand < l_best:
+                l_best = loss_cand
+                best_seed = seed_i
+                best_c = c_i
+
+        # Directional update with sliding-window acceptance (KronZO Lines 16-19).
+        window_max = max(self._window) if self._window else float("inf")
+        accepted = (best_seed is not None) and (l_best <= window_max)
+        grad_norm = 0.0
+        if accepted:
+            assert best_seed is not None and best_c is not None
+            grad_norm = self._apply_update(best_seed, best_c, ids)
+        self._push_window(l_best)
+
+        # μ update (ES / score-function) — unchanged; fed by the q probe returns.
+        self._mu_update(candidate_seeds, returns, ids)
+
+        self._step_count += 1
+        self._n_steps += 1
+        if accepted:
+            self._n_accepted += 1
+
+        self._last_metrics["projected_grad_abs"] = abs_c_sum / q
+        self._last_metrics["grad_est_norm"] = grad_norm
+        self._last_metrics["update_accepted"] = 1.0 if accepted else 0.0
+        self._last_metrics["accept_rate"] = self._n_accepted / self._n_steps
+        return center_loss

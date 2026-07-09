@@ -960,6 +960,7 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
         OptimizerType.ldsd_rl,
         OptimizerType.ldsd_rl_adamm,
         OptimizerType.ldsd_rl_sgd,
+        OptimizerType.ldsd_rl_kron,
     )
     if cfg.optimizer.name in _zo_types:
         if cfg.distributed_strategy == DistributedStrategy.fsdp:
@@ -1150,6 +1151,31 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             variance=cfg.optimizer.ldsd_rl_variance,
             perturbation_mode=cfg.optimizer.zo_perturbation_mode,
             weight_decay=cfg.optimizer.weight_decay,
+        )
+    elif cfg.optimizer.name == OptimizerType.ldsd_rl_kron:
+        from .ldsd_optim import LDSDRlKron
+
+        zg = _zo_param_groups(cfg, model)
+        for g in zg:
+            g["beta"] = cfg.optimizer.ldsd_rl_beta
+            g["betas"] = cfg.optimizer.betas
+            g["momentum"] = cfg.optimizer.ldsd_rl_sgd_momentum
+        return LDSDRlKron(
+            zg,
+            lr=cfg.optimizer.learning_rate,
+            zo_eps=cfg.optimizer.zo_eps,
+            query_budget=cfg.optimizer.ldsd_rl_kron_query_budget,
+            history_length=cfg.optimizer.ldsd_rl_kron_history_length,
+            variance=cfg.optimizer.ldsd_rl_variance,
+            beta=cfg.optimizer.ldsd_rl_beta,
+            betas=cfg.optimizer.betas,
+            momentum=cfg.optimizer.ldsd_rl_sgd_momentum,
+            params_ratio=cfg.optimizer.ldsd_rl_params_ratio,
+            perturbation_mode=cfg.optimizer.zo_perturbation_mode,
+            weight_decay=cfg.optimizer.weight_decay,
+            apply=cfg.optimizer.ldsd_rl_kron_apply,
+            mu_return=cfg.optimizer.ldsd_rl_kron_mu_return,
+            mu_init=cfg.optimizer.ldsd_rl_mu_init,
         )
     else:
         raise NotImplementedError

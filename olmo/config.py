@@ -515,6 +515,7 @@ class OptimizerType(StrEnum):
     ldsd_rl = "ldsd_rl"
     ldsd_rl_adamm = "ldsd_rl_adamm"
     ldsd_rl_sgd = "ldsd_rl_sgd"
+    ldsd_rl_kron = "ldsd_rl_kron"
 
 
 @dataclass
@@ -670,6 +671,39 @@ class OptimizerConfig(BaseConfig):
     """LDSDRl / LDSDRlAdaMM / LDSDRlSgd: only used when ``ldsd_rl_mu_init_from_fo=True``.
     If true, L2-normalize the FO gradient (global norm across all trainable params) before
     assigning it to μ_0; if false, use the raw FO gradient."""
+
+    # --- LDSDRlKron (ZO-RL policy + KronZO directional selection) ---
+
+    ldsd_rl_kron_query_budget: int = 10
+    """LDSDRlKron: number of probe directions q evaluated per step (plays the role of ``k``
+    in plain LDSDRl and of ``q`` in KronZO). Cost is 1 + 3q forward passes (two_side) or
+    1 + 2q (one_side)."""
+
+    ldsd_rl_kron_history_length: int = 10
+    """LDSDRlKron: length h of the sliding loss window for KronZO's acceptance test. The step
+    is applied only if the best candidate loss beats the worst loss in the window. 0 disables
+    the test (always accept)."""
+
+    ldsd_rl_kron_apply: str = "kron"
+    """LDSDRlKron: how θ moves once KronZO has picked the best direction (seed, c_best).
+      * ``kron``     — pure KronZO step ``θ -= α·c_best·z_best`` (no extra optimizer state);
+      * ``sign_sgd`` — LDSDRl-style: grad_accum ← β·accum + (1-β)·(c_best·z_best), θ -= α·sign(accum);
+      * ``sgd``      — LDSDRlSgd-style SGD (+ optional momentum) on grad = c_best·z_best;
+      * ``adamm``    — LDSDRlAdaMM-style AMSGrad on grad = c_best·z_best.
+    KronZO only selects the direction; this chooses how it is consumed."""
+
+    ldsd_rl_kron_mu_return: str = "perturbed"
+    """LDSDRlKron: which loss is used as the return f_i feeding the (unchanged) ES μ-update.
+      * ``perturbed`` — f_i = L(θ+ε·z_i); identical to plain LDSDRl and gives μ a directional
+        (sign-aware) signal. Recommended.
+      * ``candidate`` — f_i = L(θ − α·c_i·z_i); the same signal KronZO selects on, but it is
+        symmetric in z_i ↦ −z_i so it carries no sign information for μ."""
+
+    ldsd_rl_mu_init: str = "zero"
+    """LDSDRlKron: initial μ_0 when ``ldsd_rl_mu_init_from_fo`` is false.
+      * ``zero``   — μ_0 = 0 (isotropic N(0, σ²) probes at start; μ drifts via ES);
+      * ``random`` — μ_0 = random unit vector (plain LDSDRl default).
+    Orthogonal to ``ldsd_rl_mu_init_from_fo`` (FO-gradient init overrides this on step 1)."""
 
     def __post_init__(self):
         self.betas = tuple(self.betas)  # type: ignore[assignment]

@@ -65,7 +65,7 @@ from .torch_util import (
     synchronize_flag,
     synchronize_value,
 )
-from .ldsd_optim import LDSDMuon, LDSDRl, LDSDRlAdaMM, LDSDRlSgd
+from .ldsd_optim import LDSDMuon, LDSDRl, LDSDRlAdaMM, LDSDRlKron, LDSDRlSgd
 from .zo_optim import ZeroOrderOptimizer, ZoAdam
 from .zo_fo_direction_strategy import (
     ZoFODirectionRuntime,
@@ -1180,7 +1180,7 @@ class Trainer:
         )
         should_init_mu_from_fo = (
             self.cfg.optimizer.ldsd_rl_mu_init_from_fo
-            and isinstance(self.optim, (LDSDRl, LDSDRlAdaMM, LDSDRlSgd))
+            and isinstance(self.optim, (LDSDRl, LDSDRlAdaMM, LDSDRlSgd, LDSDRlKron))
             and not self._ldsd_rl_mu_fo_initialized
             # global_step is incremented before train_step() is called, so `1` is the very
             # first batch of a fresh run; guards against clobbering μ on checkpoint resume.
