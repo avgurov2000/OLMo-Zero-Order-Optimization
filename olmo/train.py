@@ -118,7 +118,6 @@ class SpeedMonitor:
 
         # plot flops related metrics
         metrics["throughput/total_training_Gflops"] = self.total_training_Gflops
-        metrics["throughput/total_training_log_Gflops"] = math.log(self.total_training_Gflops)
 
         if self.start_times:
             interval_seconds = time.monotonic() - self.start_times[0]
@@ -303,6 +302,14 @@ class Trainer:
         else:
             self._zo_fo_direction_runtime = ZoFODirectionRuntime()
             self._zo_fo_direction_strategy = None
+
+        # ZO-vs-FO gradient cosine diagnostic (only for ZO optimizers that support it).
+        self._zo_fo_cosine_enabled: bool = (
+            isinstance(self.optim, ZeroOrderOptimizer)
+            and getattr(self.cfg.optimizer, "zo_fo_cosine_enabled", False)
+            and hasattr(self.optim, "fo_cosine_metrics")
+        )
+        self._zo_fo_cosine_interval: int = max(1, getattr(self.cfg.optimizer, "zo_fo_cosine_interval", 50))
 
         ps: Optional[PhaseSwitchConfig] = self.cfg.phase_switch
         if ps is not None:
@@ -1221,7 +1228,30 @@ class Trainer:
                     self.cfg.max_grad_norm_ratio, self.scheduler_current, self.scheduler_max
                 )
 
+        # ZO-vs-FO cosine diagnostic: compute the TRUE first-order gradient at the
+        # current weights θ_k *before* the optimizer moves them. This is an extra
+        # forward+backward (full FO memory) so it only runs on the probe interval.
+        # `step()` below leaves p.grad untouched, so we read it again afterwards.
+        do_fo_cosine = self._zo_fo_cosine_enabled and (
+            self.global_step % self._zo_fo_cosine_interval == 0
+        )
+        if do_fo_cosine:
+            self.optim.zero_grad(set_to_none=True)
+            self.train_batch(batch)  # populates p.grad with ∇L(θ_k)
+
         loss = self.optim.step(closure, z_seed=z_seed)  # type: ignore[call-arg]
+
+        if do_fo_cosine:
+            for _k, _v in self.optim.fo_cosine_metrics().items():  # type: ignore[attr-defined]
+                metrics[f"zo_fo/{_k}"] = _v
+            self.optim.zero_grad(set_to_none=True)
+            # The probe ran a full FO backward, which spikes live memory, grows the
+            # caching-allocator pool and bumps the (sticky) CUDA peak counter. Release
+            # it all so the System/*GPU*Memory* metrics keep reflecting the true ZO
+            # footprint instead of this once-per-interval diagnostic step.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
 
         ce_batch_loss = loss.detach()
         if ce_batch_loss.device != self.device:
@@ -1245,12 +1275,45 @@ class Trainer:
             for _k, _v in self._zo_fo_compare.compute_metrics(self.optim).items():
                 metrics[f"zo_fo_compare/{_k}"] = _v
 
+        # ZO query cost. Forward (loss) evaluations are the natural cost unit for
+        # zeroth-order methods: a ZO step does no backward but several forwards, so the
+        # FLOPs/throughput counters (which assume one fwd+bwd) understate ZO cost. This
+        # gives an honest x-axis for comparing ZO variants and ZO-vs-FO. The cumulative
+        # count is derived from global_step so it survives checkpoint restarts.
+        n_fwd = self._zo_forward_passes_per_step()
+        if n_fwd:
+            metrics["optim/zo_forward_passes"] = float(n_fwd)
+            metrics["throughput/zo_forward_passes_total"] = float(self.global_step * n_fwd)
+
         self.cur_train_loss = ce_batch_loss.item()
         self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)
         metrics["train/CrossEntropyLoss"] = self.cur_train_loss
         metrics["train/Perplexity"] = math.exp(self.cur_train_loss)
 
         return metrics
+
+    def _zo_forward_passes_per_step(self) -> int:
+        """Number of forward (loss) evaluations the ZO optimizer performs per step.
+
+        Mirrors the query budget of each ZO estimator (cf. the 2q/3q forward-pass
+        accounting in the ZO / KronZO literature):
+          * MeZO / ZoAdam / LOZO: two-sided or one-sided SPSA -> 2 forwards per probe.
+          * ZOMuon: antithetic two-sided (num_samples==1) -> 2; centre-based -> 1 + N.
+          * KronZO: 1 center + (3 two_side / 2 one_side) per probe.
+        Returns 0 for non-ZO optimizers so the metric is simply skipped.
+        """
+        inner = getattr(self.optim, "_zo", self.optim)  # unwrap any wrapper
+        defaults = getattr(inner, "defaults", {})
+        if "query_budget" in defaults:  # KronZO: 1 center + (3 or 2) per probe
+            q = defaults["query_budget"]
+            per_probe = 3 if defaults.get("perturbation_mode", "two_side") == "two_side" else 2
+            return 1 + per_probe * q
+        if "num_samples" in defaults:  # ZOMuon family
+            num_samples = defaults["num_samples"]
+            return 2 if num_samples == 1 else 1 + num_samples
+        if "num_pert_samples" in defaults:  # MeZO / ZoAdam / LOZO
+            return 2 * defaults["num_pert_samples"]
+        return 0
 
     @property
     def _phase1_sched_current(self) -> int:
@@ -1668,6 +1731,13 @@ class Trainer:
             peak_gpu_mb = peak_gpu_memory()
             if peak_gpu_mb is not None:
                 metrics["System/Peak GPU Memory (MB)"] = peak_gpu_mb
+            # Live footprint. The core selling point of ZO training is memory: with no
+            # backward pass it stores no activations/grads, so these should sit well below
+            # a first-order run on the same model. Logging reserved+allocated makes that
+            # advantage (and any fragmentation) visible, not just the peak.
+            if torch.cuda.is_available():
+                metrics["System/GPU Reserved Memory (MB)"] = torch.cuda.memory_reserved() / 1.0e6
+                metrics["System/GPU Allocated Memory (MB)"] = torch.cuda.memory_allocated() / 1.0e6
         return metrics
 
     def log_metrics_to_console(self, prefix: str, metrics: Dict[str, float]):

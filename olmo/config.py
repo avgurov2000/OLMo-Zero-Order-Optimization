@@ -509,6 +509,7 @@ class OptimizerType(StrEnum):
     lozo = "lozo"
     zo_adam = "zo_adam"
     zo_muon = "zo_muon"
+    kron_zo = "kron_zo"
     ldsd_muon = "ldsd_muon"
     ldsd_sign_sgd = "ldsd_sign_sgd"
     ldsd_rl = "ldsd_rl"
@@ -574,6 +575,54 @@ class OptimizerConfig(BaseConfig):
 
     zo_muon_ns_steps: int = 5
     """ZOMuon: number of Newton-Schulz iterations for orthogonalizing lowdim_rge."""
+
+    # --- KronZO (Kronecker-factored zero-order, GERAD G-2025-44) ---
+
+    kronzo_step_interval: int = 50
+    """KronZO: how often the frozen Kronecker factor B is refreshed (ν). 1 = every step."""
+
+    kronzo_query_budget: int = 10
+    """KronZO: number of probe directions q evaluated per step. Cost is
+    1 + 3q forward passes (two_side) or 1 + 2q (one_side). The paper uses q = 10..50."""
+
+    kronzo_history_length: int = 10
+    """KronZO: length h of the sliding loss window for the directional-update acceptance
+    test. The step is applied only if the best probe loss beats the worst loss in the
+    window. 0 disables the test (always accept)."""
+
+    kronzo_orthogonal_probes: bool = False
+    """KronZO: QR-orthogonalize the q probe directions within each step so they are
+    mutually orthogonal (maximizes coverage of the B-induced subspace per step) instead
+    of i.i.d. Gaussian. Cheap (orthogonalizes the small A factors). Combine with
+    kronzo_step_interval=1 to also vary the subspace every step."""
+
+    kronzo_momentum: float = 0.0
+    """KronZO: heavy-ball momentum β on the ZO gradient estimate (0 disables). The chosen
+    per-step direction is integrated into a buffer ``m ← β·m + c_best·Z_best`` and the
+    step becomes ``θ -= lr·m``. Averages many (near-unbiased) probes over time, so the
+    effective alignment with the true gradient grows ~√(1/(1-β)) — the cheapest way to
+    sharpen the direction without any backward. Costs one extra buffer per parameter.
+    Typical: 0.9 (effective ~10-step averaging)."""
+
+    kronzo_line_search_steps: int = 0
+    """KronZO: after an accepted step, keep stepping along the same direction while the
+    (same-batch) loss keeps dropping, up to this many extra steps (0 disables). Rides good
+    directions and amortizes the expensive 1+3q probe sampling over several real moves
+    (adaptive step length). Each extension is one extra forward; keep small (3-5) since the
+    direction is chosen on a single minibatch."""
+
+    # --- ZO-vs-FO gradient alignment diagnostic ---
+
+    zo_fo_cosine_enabled: bool = False
+    """If True (only for zero-order optimizers), periodically run an extra forward+backward
+    to obtain the *true* first-order gradient at the current weights and log its cosine
+    similarity with the ZO gradient estimate (``zo_fo/cosine*`` in W&B).
+    NOTE: the extra backward stores activations/grads, so on these steps memory and time
+    rise to first-order levels — keep it throttled via ``zo_fo_cosine_interval`` and off
+    for production runs. The optimizer must implement ``fo_cosine_metrics`` (KronZO does)."""
+
+    zo_fo_cosine_interval: int = 50
+    """How often (in steps) to compute the ZO-vs-FO cosine when ``zo_fo_cosine_enabled``."""
 
     mezo_momentum: float = 0.0
     """MeZO-only: momentum on the estimated gradient direction."""

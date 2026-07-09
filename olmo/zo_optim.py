@@ -984,3 +984,500 @@ class ZOMuon(ZeroOrderOptimizer):
                     p.data.mul_(1.0 - lr * weight_decay)
 
         self._last_metrics["grad_est_norm"] = math.sqrt(grad_sum_sq)
+
+
+# ---------------------------------------------------------------------------
+# KronZO
+# ---------------------------------------------------------------------------
+
+def _best_pair(n: int) -> tuple[int, int]:
+    """Two divisors of ``n`` closest to ``sqrt(n)`` (Algorithm 1 ``BestPair`` in KronZO).
+
+    Returns ``(1, n)`` for primes (the paper notes this is rare for LM layer widths).
+    """
+    if n <= 1:
+        return (1, n)
+    root = int(math.isqrt(n))
+    for offset in range(root + 1):
+        for cand in (root - offset, root + offset):
+            if cand >= 1 and n % cand == 0:
+                return (cand, n // cand)
+    return (1, n)  # fallback for primes
+
+
+class KronZO(ZeroOrderOptimizer):
+    """Zeroth-order Kronecker optimization for LM pretraining (KronZO).
+
+    Implements "Zeroth-order Kronecker optimization for pretraining language models"
+    (Allaire, Le Digabel, Orban, Partovi Nia, GERAD G-2025-44).
+
+    Two ideas vs. MeZO / LOZO:
+
+    1. **Kronecker-factored perturbations** (Algorithm 1).  For a 2-D weight
+       ``W ∈ R^{m×n}`` the probe direction is ``Z = A ⊗ B`` where
+       ``A ∈ R^{m1×n1}``, ``B ∈ R^{m2×n2}`` with ``m1·m2 = m`` and ``n1·n2 = n``,
+       each factor chosen as close to square as possible.  Because
+       ``rank(A⊗B) = rank(A)·rank(B)``, ``Z`` is almost surely **full rank** (so it
+       explores the whole subspace, unlike low-rank LOZO) while only the tiny
+       factors are stored.  ``B`` is frozen for ``step_interval`` steps (like ``V``
+       in LOZO); ``A`` is resampled for every probe.  1-D params use a plain
+       Gaussian probe.
+
+    2. **Criterion-driven directional update** (Algorithm 2, "lucky RGE").  Each
+       step samples ``query_budget`` (``q``) probes; for each it forms the SPSA
+       scalar ``c_i = (L(θ+εZ_i) − L(θ−εZ_i)) / 2ε`` and *evaluates the candidate
+       step* ``L(θ − α c_i Z_i)``.  Only the single best-decreasing direction is
+       kept (not the average).  The step is then accepted only if that best loss
+       beats the worst of the last ``history_length`` (``h``) accepted losses;
+       otherwise the step is skipped.  Cost per step: ``1 + 3q`` forward passes
+       (two-sided) or ``1 + 2q`` (one-sided).
+
+    Probes are regenerated from seeds rather than stored, keeping the live memory
+    footprint at one parameter-sized temporary.  DDP: ``A`` is seeded from the
+    externally broadcast ``z_seed`` and ``B`` from the globally-synchronized
+    ``_step_count``, while the closure all-reduces the loss, so every rank derives
+    identical scalars, accept/reject decisions and updates without gradient
+    communication.  FSDP is not supported (blocked in ``build_optimizer``).
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        zo_eps: float = 1e-3,
+        step_interval: int = 50,
+        query_budget: int = 10,
+        history_length: int = 10,
+        perturbation_mode: str = "two_side",
+        weight_decay: float = 0.0,
+        orthogonal_probes: bool = False,
+        momentum: float = 0.0,
+        line_search_steps: int = 0,
+    ):
+        if lr < 0:
+            raise ValueError(f"Invalid lr: {lr}")
+        if zo_eps <= 0:
+            raise ValueError(f"Invalid zo_eps: {zo_eps}")
+        if step_interval < 1:
+            raise ValueError(f"Invalid step_interval: {step_interval}")
+        if query_budget < 1:
+            raise ValueError(f"Invalid query_budget: {query_budget}")
+        if history_length < 0:
+            raise ValueError(f"Invalid history_length: {history_length}")
+        if perturbation_mode not in ("two_side", "one_side"):
+            raise ValueError("perturbation_mode must be 'two_side' or 'one_side'")
+        if not (0.0 <= momentum < 1.0):
+            raise ValueError(f"momentum must be in [0, 1): {momentum}")
+        if line_search_steps < 0:
+            raise ValueError(f"line_search_steps must be >= 0: {line_search_steps}")
+
+        defaults = dict(
+            lr=lr,
+            zo_eps=zo_eps,
+            step_interval=step_interval,
+            query_budget=query_budget,
+            history_length=history_length,
+            perturbation_mode=perturbation_mode,
+            weight_decay=weight_decay,
+            orthogonal_probes=orthogonal_probes,
+            momentum=momentum,
+            line_search_steps=line_search_steps,
+        )
+        super().__init__(params, defaults)
+        self._step_count = 0
+        # Sliding window of the last `history_length` accepted losses; prefilled with
+        # +inf so the first `h` steps always pass the acceptance test.
+        self._window: list[float] = [float("inf")] * history_length
+        self._n_steps = 0
+        self._n_accepted = 0
+        self._last_metrics: dict[str, float] = {}
+        # Per-step probe bookkeeping for the optional ZO-vs-FO cosine diagnostic:
+        # the (seed, scalar) of every probe and the index of the lowest-loss one.
+        self._probe_samples: list[tuple[int, float]] = []
+        self._best_probe_idx: int = -1
+        # Orthogonal-probe support: seeds of the current step's q probes and a per-step,
+        # per-parameter cache of the QR-orthogonalized A factors (rebuilt each step).
+        self._probe_seeds: list[int] = []
+        self._seed_pos: dict[int, int] = {}
+        self._ortho_cache: dict[int, torch.Tensor] = {}
+
+    def get_post_step_metrics(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+        """Return KronZO diagnostics from the last step.
+
+        Metrics
+        -------
+        projected_grad_abs
+            Mean ``|c_i|`` over the ``q`` probes (SPSA signal strength).
+        grad_est_norm
+            Frobenius norm of the applied update direction ``c_best · Z_best``
+            (0.0 when the step was skipped).  Computed cheaply via the Kronecker
+            identity ``||A⊗B||_F = ||A||_F · ||B||_F`` without materializing ``Z``.
+        update_accepted
+            1.0 if the directional update was applied this step, else 0.0
+            (a step is skipped when no probe improved on the center loss, or the
+            best loss did not beat the acceptance window).
+        accept_rate
+            Running fraction of accepted steps (the paper observes ~90%).
+        """
+        return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
+
+    @torch.no_grad()
+    def fo_cosine_metrics(self) -> dict[str, float]:
+        """Cosine similarity between KronZO's ZO gradient estimate and the true FO gradient.
+
+        Must be called right after ``step()`` and after a real backward has populated
+        ``p.grad`` for these parameters at the *same* weights θ_k (the trainer arranges
+        this on its probe interval).  Reconstructs the probe directions from the seeds
+        stored during the last step and reports two alignments:
+
+        ``cosine_selected``
+            cos(∠) between the *lucky* probe KronZO actually uses (lowest candidate
+            loss, ``c_best·Z_best``) and ∇L.  How good the chosen step direction is.
+        ``cosine_qrge``
+            cos(∠) between the unbiased q-RGE average ``(1/q)·Σ c_i Z_i`` and ∇L.
+            How good the raw averaged estimator is (improves with q, degrades with
+            dimension — the "dilution" the directional update is designed to beat).
+
+        Returns ``{}`` if no probe data or no gradients are available.
+        """
+        samples = self._probe_samples
+        if not samples or self._best_probe_idx < 0:
+            return {}
+        q = len(samples)
+        best_seed, best_c = samples[self._best_probe_idx]
+
+        dot_sel = norm_sel = 0.0
+        dot_avg = norm_avg = 0.0
+        norm_g = 0.0
+        for _group, p, idx in self._flat_params():
+            if not p.requires_grad or p.grad is None:
+                continue
+            g = p.grad.float()
+            norm_g += g.pow(2).sum().item()
+
+            # Selected ("lucky") direction c_best · Z_best.
+            sel = self._build_z(p, idx, best_seed).float().mul_(best_c)
+            dot_sel += (g * sel).sum().item()
+            norm_sel += sel.pow(2).sum().item()
+
+            # Unbiased q-RGE average (1/q) Σ c_i Z_i.
+            avg = torch.zeros_like(g)
+            for seed_i, c_i in samples:
+                avg.add_(self._build_z(p, idx, seed_i).float(), alpha=c_i)
+            avg.div_(q)
+            dot_avg += (g * avg).sum().item()
+            norm_avg += avg.pow(2).sum().item()
+
+        if norm_g == 0.0:
+            return {}
+        eps = 1e-12
+        return {
+            "cosine_selected": dot_sel / (math.sqrt(norm_g * norm_sel) + eps),
+            "cosine_qrge": dot_avg / (math.sqrt(norm_g * norm_avg) + eps),
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _flat_params(self):
+        idx = 0
+        for group in self.param_groups:
+            for p in group["params"]:
+                yield group, p, idx
+                idx += 1
+
+    def _get_a(self, p: torch.Tensor, dims: tuple, z_seed: int, idx: int) -> torch.Tensor:
+        m1, n1, _m2, _n2 = dims
+        gen = torch.Generator(device=p.device)
+        gen.manual_seed((z_seed + idx * 1_000_003) % (2**31))
+        return torch.randn(m1, n1, device=p.device, dtype=p.dtype, generator=gen)
+
+    def _a_for(self, p: torch.Tensor, dims: tuple, seed: int, idx: int) -> torch.Tensor:
+        """Return the A factor for one probe — raw Gaussian, or (if enabled) the
+        QR-orthogonalized variant so the step's q probes are mutually orthogonal.
+
+        Since ``<A_i⊗B, A_j⊗B> = <A_i,A_j>·||B||²`` (B is frozen within the step),
+        orthogonalizing the small A factors makes the full perturbations Z_i orthogonal,
+        maximizing coverage of the B-induced subspace per step. The orthonormal columns
+        are rescaled to the Gaussian norm √(m1·n1) so ε / lr keep their scale. The whole
+        set is reproducible from the step's seeds, so every regeneration point agrees.
+        """
+        if not self.defaults.get("orthogonal_probes", False):
+            return self._get_a(p, dims, seed, idx)
+        m1, n1, _m2, _n2 = dims
+        q = len(self._probe_seeds)
+        # Can't orthogonalize more vectors than the subspace dimension — fall back.
+        if q < 2 or m1 * n1 < q:
+            return self._get_a(p, dims, seed, idx)
+        cache = self._ortho_cache.get(idx)
+        if cache is None:
+            raws = torch.stack(
+                [self._get_a(p, dims, s, idx).float().reshape(-1) for s in self._probe_seeds],
+                dim=1,
+            )  # (m1*n1, q)
+            qmat, _ = torch.linalg.qr(raws, mode="reduced")  # orthonormal columns (m1*n1, q)
+            cache = (qmat * math.sqrt(m1 * n1)).t().reshape(q, m1, n1).to(p.dtype)  # (q, m1, n1)
+            self._ortho_cache[idx] = cache
+        return cache[self._seed_pos[seed]]
+
+    def _refresh_b(self, p: torch.Tensor, dims: tuple, idx: int) -> torch.Tensor:
+        _m1, _n1, m2, n2 = dims
+        gen = torch.Generator(device=p.device)
+        gen.manual_seed((self._step_count * 1_000_003 + idx * 999_983) % (2**31))
+        return torch.randn(m2, n2, device=p.device, dtype=p.dtype, generator=gen)
+
+    def _get_z1d(self, p: torch.Tensor, z_seed: int, idx: int) -> torch.Tensor:
+        gen = torch.Generator(device=p.device)
+        gen.manual_seed((z_seed + idx * 999_983) % (2**31))
+        return torch.randn(p.shape, device=p.device, dtype=p.dtype, generator=gen)
+
+    def _ensure_state(self) -> None:
+        """Cache per-param Kronecker dims and (re)sample the frozen factor ``B``."""
+        refresh = self._step_count % self.defaults["step_interval"] == 0
+        for _group, p, idx in self._flat_params():
+            if not p.requires_grad:
+                continue
+            if p.dim() != 2:
+                continue
+            state = self.state[p]
+            if "kron_dims" not in state:
+                m, n = p.shape
+                m1, m2 = _best_pair(int(m))
+                n1, n2 = _best_pair(int(n))
+                state["kron_dims"] = (m1, n1, m2, n2)
+            if refresh or "B" not in state:
+                state["B"] = self._refresh_b(p, state["kron_dims"], idx)
+
+    def _build_z(self, p: torch.Tensor, idx: int, seed: int) -> torch.Tensor:
+        """Regenerate the full perturbation ``Z`` for one parameter from ``seed``."""
+        if p.dim() == 2:
+            dims = self.state[p]["kron_dims"]
+            a = self._a_for(p, dims, seed, idx)
+            b = self.state[p]["B"]
+            return torch.kron(a, b)
+        return self._get_z1d(p, seed, idx)
+
+    def _perturb_eps(self, seed: int, sign: float) -> None:
+        """θ += sign · ε · Z   (finite-difference probe, single global ε)."""
+        eps = self.defaults["zo_eps"]
+        for _group, p, idx in self._flat_params():
+            if not p.requires_grad:
+                continue
+            p.data.add_(self._build_z(p, idx, seed), alpha=sign * eps)
+
+    def _perturb_step(self, seed: int, c: float, sign: float) -> None:
+        """θ += sign · lr · c · Z   (candidate / trial step, per-group lr)."""
+        for group, p, idx in self._flat_params():
+            if not p.requires_grad:
+                continue
+            p.data.add_(self._build_z(p, idx, seed), alpha=sign * group["lr"] * c)
+
+    def _apply_best(self, seed: int, c: float) -> float:
+        """Apply the accepted update ``θ -= lr · c · Z`` (+ decoupled weight decay).
+
+        Returns the Frobenius norm of ``c · Z`` summed over params (the update
+        direction magnitude), computed via ``||A⊗B||_F = ||A||_F · ||B||_F``.
+        """
+        grad_sq = 0.0
+        for group, p, idx in self._flat_params():
+            if not p.requires_grad:
+                continue
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+            if p.dim() == 2:
+                dims = self.state[p]["kron_dims"]
+                a = self._a_for(p, dims, seed, idx)
+                b = self.state[p]["B"]
+                grad_sq += (c * a.float().norm().item() * b.float().norm().item()) ** 2
+                z = torch.kron(a, b)
+            else:
+                z = self._get_z1d(p, seed, idx)
+                grad_sq += (c * z.float().norm().item()) ** 2
+            p.data.add_(z, alpha=-lr * c)
+            if weight_decay != 0.0:
+                p.data.mul_(1.0 - lr * weight_decay)
+        return math.sqrt(max(grad_sq, 0.0))
+
+    def _momentum_step(self, seed: Optional[int], c: Optional[float], accepted: bool) -> float:
+        """Heavy-ball momentum update.
+
+        Keeps a per-parameter buffer ``m`` and integrates the step's chosen ZO direction
+        into it: ``m ← β·m + c_best·Z_best`` when the step is accepted (otherwise ``m`` just
+        decays, ``m ← β·m``). The parameters always move along the accumulated direction,
+        ``θ ← θ − lr·m`` (+ decoupled weight decay).
+
+        Because the per-step estimates are (near-)unbiased, this averages many probes over
+        time, so the effective alignment with the true gradient grows roughly like
+        ``√(1/(1−β) / d)`` instead of ``1/√d`` for a single step — the cheapest way to
+        "guess" the gradient better without any backward pass. Costs one extra full-size
+        buffer per parameter (still far below first-order, which also stores activations).
+        """
+        beta = self.defaults["momentum"]
+        upd_sq = 0.0
+        for group, p, idx in self._flat_params():
+            if not p.requires_grad:
+                continue
+            state = self.state[p]
+            mom = state.get("mom")
+            if mom is None:
+                mom = torch.zeros_like(p, dtype=torch.float32)
+                state["mom"] = mom
+            if accepted:
+                assert seed is not None and c is not None
+                # EMA so ||m|| stays on the scale of a single estimate -> lr keeps its meaning
+                # (heavy-ball would amplify the step by ~1/(1-β) and needs a smaller lr).
+                mom.mul_(beta).add_(self._build_z(p, idx, seed).float(), alpha=c * (1.0 - beta))
+            else:
+                mom.mul_(beta)
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+            p.data.add_(mom.to(p.dtype), alpha=-lr)
+            if weight_decay != 0.0:
+                p.data.mul_(1.0 - lr * weight_decay)
+            upd_sq += mom.norm().item() ** 2
+        return math.sqrt(max(upd_sq, 0.0))
+
+    def _step_along_momentum(self, sign: float) -> None:
+        """θ += sign · lr · m   (move one more step along the momentum buffer)."""
+        for group, p, _idx in self._flat_params():
+            if not p.requires_grad:
+                continue
+            mom = self.state[p].get("mom")
+            if mom is None:
+                continue
+            p.data.add_(mom.to(p.dtype), alpha=sign * group["lr"])
+
+    def _line_search(self, extend: Callable[[], None], undo: Callable[[], None],
+                     closure: Callable[[], torch.Tensor], k_max: int) -> int:
+        """Greedily keep stepping along the just-applied direction while the loss drops.
+
+        Once a direction has been accepted, this rides it: re-apply the same update and
+        evaluate the (same-batch) loss; keep it while it strictly improves, otherwise undo
+        the last extension and stop. Amortizes the expensive 1+3q probe sampling over
+        several real moves and acts as an adaptive step length. ``extend``/``undo`` move
+        one step forward/back along the direction. Returns how many extra steps were taken.
+        """
+        cur = closure().item()
+        taken = 0
+        for _ in range(k_max):
+            extend()
+            nxt = closure().item()
+            if nxt < cur:
+                cur = nxt
+                taken += 1
+            else:
+                undo()  # revert the non-improving extension
+                break
+        return taken
+
+    def _push_window(self, loss: float) -> None:
+        """Replace the worst (max) loss in the acceptance window with ``loss``."""
+        if not self._window:
+            return
+        j = max(range(len(self._window)), key=lambda k: self._window[k])
+        self._window[j] = loss
+
+    # ------------------------------------------------------------------
+    # Step
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def step(self, closure: Callable[[], torch.Tensor], z_seed: Optional[int] = None) -> torch.Tensor:
+        if z_seed is None:
+            z_seed = int(np.random.randint(0, 1_000_000_000))
+
+        self._ensure_state()
+        eps = self.defaults["zo_eps"]
+        q = self.defaults["query_budget"]
+        two_side = self.defaults["perturbation_mode"] == "two_side"
+
+        # Fix this step's q probe seeds up front so every regeneration point agrees,
+        # and reset the per-step orthogonalization cache (depends on these seeds).
+        self._probe_seeds = [(z_seed + i * 987_654_321) % (2**31) for i in range(q)]
+        self._seed_pos = {s: i for i, s in enumerate(self._probe_seeds)}
+        self._ortho_cache = {}
+
+        # Line 5: center loss at θ_k. Also the value reported to the trainer.
+        center_loss = closure()
+        l_best = center_loss.item()
+        best_seed: Optional[int] = None
+        best_c: Optional[float] = None
+        abs_c_sum = 0.0
+        samples: list[tuple[int, float]] = []
+        best_probe_idx = -1
+        best_probe_loss = float("inf")
+
+        for i in range(q):
+            seed_i = self._probe_seeds[i]
+
+            # SPSA scalar c_i along Z_i.
+            self._perturb_eps(seed_i, +1.0)
+            loss_plus = closure().item()
+            if two_side:
+                self._perturb_eps(seed_i, -2.0)
+                loss_minus = closure().item()
+                self._perturb_eps(seed_i, +1.0)  # restore θ
+                c_i = (loss_plus - loss_minus) / (2.0 * eps)
+            else:
+                self._perturb_eps(seed_i, -1.0)  # restore θ
+                c_i = (loss_plus - l_best) / eps
+            abs_c_sum += abs(c_i)
+            samples.append((seed_i, c_i))
+
+            # Evaluate the candidate step L(θ − lr·c_i·Z_i), then restore.
+            self._perturb_step(seed_i, c_i, -1.0)
+            loss_cand = closure().item()
+            self._perturb_step(seed_i, c_i, +1.0)
+
+            if loss_cand < best_probe_loss:
+                best_probe_loss = loss_cand
+                best_probe_idx = i
+            if loss_cand < l_best:
+                l_best = loss_cand
+                best_seed = seed_i
+                best_c = c_i
+
+        self._probe_samples = samples
+        self._best_probe_idx = best_probe_idx
+
+        # Directional update with sliding-window acceptance (Lines 16-19).
+        window_max = max(self._window) if self._window else float("inf")
+        accepted = (best_c is not None) and (l_best <= window_max)
+        grad_norm = 0.0
+        use_momentum = self.defaults["momentum"] > 0.0
+        if use_momentum:
+            # Momentum mode: the gate decides what enters the buffer; we always step along it.
+            grad_norm = self._momentum_step(best_seed, best_c, accepted)
+        elif accepted:
+            assert best_seed is not None and best_c is not None
+            grad_norm = self._apply_best(best_seed, best_c)
+
+        # Line search: once a step is applied, keep riding the same direction while the
+        # (same-batch) loss keeps dropping. Extends along the momentum buffer in momentum
+        # mode, otherwise along c_best·Z_best.
+        ls_max = self.defaults["line_search_steps"]
+        n_extends = 0
+        if ls_max > 0 and accepted:
+            if use_momentum:
+                extend = lambda: self._step_along_momentum(-1.0)
+                undo = lambda: self._step_along_momentum(+1.0)
+            else:
+                extend = lambda: self._perturb_step(best_seed, best_c, -1.0)
+                undo = lambda: self._perturb_step(best_seed, best_c, +1.0)
+            n_extends = self._line_search(extend, undo, closure, ls_max)
+
+        self._push_window(l_best)
+
+        self._step_count += 1
+        self._n_steps += 1
+        if accepted:
+            self._n_accepted += 1
+
+        self._last_metrics["projected_grad_abs"] = abs_c_sum / q
+        self._last_metrics["grad_est_norm"] = grad_norm
+        self._last_metrics["update_accepted"] = 1.0 if accepted else 0.0
+        self._last_metrics["accept_rate"] = self._n_accepted / self._n_steps
+        self._last_metrics["line_search_extends"] = float(n_extends)
+
+        return center_loss
