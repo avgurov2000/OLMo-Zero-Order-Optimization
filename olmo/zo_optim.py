@@ -1636,6 +1636,7 @@ class HiZOO(ZeroOrderOptimizer):
         center_loss = closure()
         center = center_loss.item()
 
+        samples: list[tuple[int, float, float]] = []
         pg_abs_sum = 0.0
         curv_abs_sum = 0.0
         for i in range(num_pert):
@@ -1645,16 +1646,19 @@ class HiZOO(ZeroOrderOptimizer):
             loss_plus = closure().item()
             self._perturb(seed_i, scaling_factor=-2.0)   # θ − μ Σ^{1/2} u
             loss_minus = closure().item()
-            self._perturb(seed_i, scaling_factor=+1.0)   # restore θ
+            self._perturb(seed_i, scaling_factor=+1.0)   # restore θ (unmoved during sampling)
 
             projected_grad = (loss_plus - loss_minus) / (2.0 * mu)
             curvature = (loss_plus + loss_minus - 2.0 * center) / (2.0 * mu * mu)
+            samples.append((seed_i, projected_grad, curvature))
             pg_abs_sum += abs(projected_grad)
             curv_abs_sum += abs(curvature)
 
-            # Update the diagonal Hessian (Σ⁻¹) and apply the pre-conditioned
-            # descent step for this probe, both reproduced from ``seed_i``.
-            self._hessian_and_descent(seed_i, projected_grad, curvature)
+        # All n probes were evaluated at the SAME θ (restored after each pair), and
+        # against the SAME fresh center ℓ. Form a single averaged Hessian-EMA update
+        # and a single averaged pre-conditioned descent step (HiZOO-multi, Eq. 4/1),
+        # so larger n *reduces variance* instead of taking n sequential micro-steps.
+        self._apply_update(samples)
 
         self._last_metrics["projected_grad_abs"] = pg_abs_sum / num_pert
         self._last_metrics["curvature_abs"] = curv_abs_sum / num_pert
@@ -1678,18 +1682,49 @@ class HiZOO(ZeroOrderOptimizer):
                 delta = u.mul_(scaling_factor * mu).mul_(precond)
                 p.data.add_(delta.to(p.dtype))
 
-    def _hessian_and_descent(self, z_seed: int, projected_grad: float, curvature: float) -> None:
-        """EMA-update Σ⁻¹ then take the pre-conditioned descent step for one probe.
+    def _apply_update(self, samples: list[tuple[int, float, float]]) -> None:
+        """One averaged Hessian-EMA update + one averaged pre-conditioned descent step.
 
-        Σ'ₜ diagonal:  ``S · Σ⁻¹ₜ₋₁ · u²``  (S = curvature, Eq. 4).
-        EMA (Eq. 5):   ``Σ⁻¹ₜ = (1−α) Σ⁻¹ₜ₋₁ + α |diag(Σ'ₜ)|``.
-        Descent (Eq. 1/2), with the **updated** Σₜ:
-                       ``θᵢ ← θᵢ − lr · g · Σ^{1/2}ₜ,ᵢ · uᵢ``.
+        Every probe in ``samples`` was evaluated at the same θ. Per parameter we
+        average over the ``n`` probes (Eq. 4 / Eq. 1), reproducing each ``uᵢ`` from
+        its seed:
+
+            curv_u2 = (1/n) Σᵢ curvᵢ · uᵢ²      (drives the diagonal Hessian)
+            grad_u  = (1/n) Σᵢ gᵢ   · uᵢ        (the descent direction)
+
+        then update the Hessian once (old Σ⁻¹ pre-conditions the estimate, Eq. 4/5):
+
+            diag(Σ'ₜ) = Σ⁻¹ₜ₋₁ · curv_u2 ,  Σ⁻¹ₜ = (1−α) Σ⁻¹ₜ₋₁ + α |diag(Σ'ₜ)|
+
+        and take one step with the **updated** Σₜ:  ``θ ← θ − lr · grad_u · Σ^{1/2}ₜ``.
+
+        For ``n = 1`` this is identical to Algorithm 1. For ``n > 1`` the averaging
+        is the variance-reducing HiZOO-multi variant (Appendix D.2): the estimator's
+        variance falls ~1/n while θ moves once, not n times.
         """
-        self._reset_generators(z_seed)
-        num_pert = self.defaults["num_pert_samples"]
+        n = len(samples)
         alpha = self.defaults["smooth_scale"]
         hess_min = self.defaults["hessian_min"]
+
+        # Per-parameter accumulators over the n probes (Σᵢ curvᵢ·uᵢ² and Σᵢ gᵢ·uᵢ).
+        curv_u2: dict[int, torch.Tensor] = {}
+        grad_u: dict[int, torch.Tensor] = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    curv_u2[id(p)] = torch.zeros_like(p, dtype=torch.float32)
+                    grad_u[id(p)] = torch.zeros_like(p, dtype=torch.float32)
+
+        for seed_i, projected_grad, curvature in samples:
+            self._reset_generators(seed_i)
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if not p.requires_grad:
+                        continue
+                    gen = self._get_generator(p.device)
+                    u = self.vector_sampler.sample(p.shape, p.device, gen).float()
+                    curv_u2[id(p)].add_(u.mul(u), alpha=curvature)
+                    grad_u[id(p)].add_(u, alpha=projected_grad)
 
         grad_sum_sq = 0.0
         hess_sum = 0.0
@@ -1701,18 +1736,16 @@ class HiZOO(ZeroOrderOptimizer):
             for p in group["params"]:
                 if not p.requires_grad:
                     continue
-                gen = self._get_generator(p.device)
-                u = self.vector_sampler.sample(p.shape, p.device, gen).float()
                 hess = self._hess(p)  # Σ⁻¹ₜ₋₁ (float32, in-place buffer)
 
-                # Diagonal Hessian estimate and EMA (use old Σ⁻¹, then update).
-                sigma_prime = (curvature * hess).mul_(u.mul(u))  # S · Σ⁻¹ · u²
+                # Averaged diagonal Hessian estimate and one EMA update (Eq. 4/5).
+                sigma_prime = hess.mul(curv_u2[id(p)]).div_(n)  # Σ⁻¹ · (1/n)Σ curvᵢ uᵢ²
                 hess.mul_(1.0 - alpha).add_(sigma_prime.abs_(), alpha=alpha)
                 hess.clamp_(min=hess_min)
 
-                # Pre-conditioned descent with the updated Σₜ, averaged over n probes.
+                # One averaged pre-conditioned descent step with the updated Σₜ.
                 precond = torch.rsqrt(hess)  # Σ^{1/2}ₜ = 1/√Σ⁻¹ₜ
-                grad_est = u.mul_(projected_grad / num_pert).mul_(precond)
+                grad_est = grad_u[id(p)].div_(n).mul_(precond)
                 grad_sum_sq += grad_est.pow(2).sum().item()
                 if weight_decay != 0.0:
                     grad_est.add_(p.data.float(), alpha=weight_decay)
