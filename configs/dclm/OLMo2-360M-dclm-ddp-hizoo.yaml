@@ -1,0 +1,192 @@
+# OLMo2 ~360M (d_model=896, 16 слоёв), DCLM, оптимизатор HiZOO
+# (zero-order, без backward) из статьи ICLR 2025 "Second-Order Fine-Tuning without
+# Pain for LLMs: A Hessian Informed Zeroth-Order Optimizer" (Zhao, Dang, Ye, Dai,
+# Qian, Tsang). См. papers/HiZO.pdf, Algorithm 1.
+#
+# Идея HiZOO:
+#   * MeZO использует изотропную гауссову пробу u и делает шаг фиксированного масштаба
+#     независимо от кривизны. Гетерогенная кривизна параметров LLM → медленная сходимость
+#     и застревание в сёдлах.
+#   * HiZOO одним доп. forward-проходом оценивает ДИАГОНАЛЬНЫЙ гессиан и использует его как
+#     прекондиционер: Σ⁻¹ (оценка диагонали гессиана, инициализируется единицами), а
+#     Σ^{1/2} = 1/√Σ⁻¹ масштабирует и возмущение, и шаг. Получается диагональный
+#     Ньютоновский шаг только из forward-проходов.
+#
+# Стоимость шага: 3 forward-прохода (ℓ, ℓ₊, ℓ₋) против 2 у MeZO. По статье это ~1.5×
+# время/шаг, но сходимость в разы быстрее (до 8× меньше forward на SST2). Память: один
+# доп. O(d) float32 буфер (диагональ гессиана).
+#
+# Ключевые метрики в W&B:
+#   optim/projected_grad_abs, optim/curvature_abs, optim/grad_est_norm,
+#   optim/hessian_mean (≈1 в начале, дрейфует к масштабу кривизны),
+#   optim/precond_sqrt_mean (эффективный множитель шага относительно MeZO).
+#
+# Модель ~360M: d_model=896, n_layers=16, n_heads=14, mlp_ratio=8 (как в остальных
+# configs/dclm/OLMo2-360M-*). «360M» — номинальный класс; тело без эмбеддингов ~268M.
+#
+# DDP-вариант (несколько карт). FSDP с zero-order не поддерживается — только ddp/single.
+#
+# Запуск на 2 картах:
+#   uv run torchrun --nproc_per_node=2 scripts/train.py configs/dclm/OLMo2-360M-dclm-ddp-hizoo.yaml
+#
+# Конкретные карты:
+#   CUDA_VISIBLE_DEVICES=0,1 uv run torchrun --nproc_per_node=2 scripts/train.py configs/dclm/OLMo2-360M-dclm-ddp-hizoo.yaml
+#
+# Настройка: μ (zo_eps) в диапазоне 1e-4…1e-3; smooth_scale α в диапазоне 1e-4…1e-8
+# (слишком большое α → взрыв градиента / расхождение, см. Fig. 6 в статье). При
+# нестабильности уменьшайте learning_rate и/или увеличивайте zo_eps.
+
+run_name: OLMo2-360M-dclm-ddp-hizoo
+seed: 6198
+dry_run: false
+
+wandb:
+  name: ${run_name}
+  project: zo-olmo-hizoo
+  group: ${run_name}
+  entity: andrey
+
+model:
+  d_model: 896
+  n_heads: 14
+  n_layers: 16
+  mlp_ratio: 8
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_theta: 500000
+
+  flash_attention: true
+  attention_dropout: 0.0
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1e-6
+  bias_for_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  norm_after: true
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 1024
+  vocab_size: 100278
+  embedding_size: 100352
+  eos_token_id: 100257
+  pad_token_id: 100277
+  # Без FSDP нет param_init_fn с meta → веса инициализируются при создании на GPU.
+  init_device: cuda
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+
+softmax_auxiliary_loss: true
+auxiliary_loss_multiplier: 1e-5
+fused_loss: false
+
+compile: null
+
+optimizer:
+  name: hizoo
+  learning_rate: 1.0e-5      # cosine peak; ZO-шаги требуют малого lr (как MeZO)
+  weight_decay: 0.1
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  metrics_log_interval: 1
+  zo_eps: 1.0e-3             # μ — finite-difference / smoothing scale
+  zo_perturbation_mode: two_side  # для HiZOO игнорируется (алгоритм всегда 3-проходный)
+  # --- HiZOO-специфичные параметры (Algorithm 1, ICLR 2025) ---
+  hizoo_smooth_scale: 1.0e-6      # α — EMA-скорость оценки диагонали гессиана (Eq. 5)
+  hizoo_hessian_min: 1.0e-8       # числовой floor на Σ⁻¹, чтобы Σ^{1/2} не взрывался
+  # n=1 проба/шаг (Algorithm 1, дефолт статьи); >1 → HiZOO-multi (1+2n forward/шаг)
+  mezo_num_pert_samples: 1
+  mezo_vector_sampling_type: standard_normal
+  # Диагностика выравнивания ZO- и FO-градиентов. ВНИМАНИЕ: на этих шагах делается
+  # реальный backward → память/время как у first-order. Держим выключенным по умолчанию.
+  zo_fo_cosine_enabled: false
+  zo_fo_cosine_interval: 100
+
+scheduler:
+  name: cosine_with_warmup
+  units: tokens
+  t_warmup: 2000000
+  t_max: 500000000
+  alpha_f: 0.1
+  warmup_min_lr: 0.0
+
+tokenizer:
+  identifier: tokenizers/allenai_dolma2.json
+  truncate_direction: right
+
+save_folder: ./runs/OLMo2-360M-dclm-ddp-hizoo
+save_overwrite: false
+
+save_interval: 1000
+save_interval_ephemeral: 1000
+save_num_checkpoints_to_keep: 2
+save_interval_unsharded: 1000
+save_num_unsharded_checkpoints_to_keep: 2
+
+load_path: null
+try_load_latest_save: true       # после краша тот же запуск подхватит последний чекпойнт
+
+global_train_batch_size: 512
+device_train_microbatch_size: 4
+
+max_duration: 500000000T
+
+precision: amp_bf16
+
+distributed_strategy: ddp
+
+ddp:
+  grad_sync_mode: batch
+  find_unused_params: false
+
+max_grad_norm: 1.0
+max_grad_norm_ratio: null
+
+speed_monitor:
+  window_size: 1
+
+gen1_gc_interval: 10
+
+eval_interval: 1000
+eval_subset_num_batches: -1
+device_eval_batch_size: ${device_train_microbatch_size}
+
+evaluators:
+  - label: dolma_wiki-validation
+    type: lm
+    data:
+      pad_direction: right
+      num_workers: 4
+      drop_last: true
+      pin_memory: true
+      prefetch_factor: 2
+      persistent_workers: true
+      memmap_dtype: uint32
+      paths:
+        - /data/users/vtrofimov/OLMo-Zero-Order-Optimization/data/wikitext/validation/0_00000.npy
+
+data:
+  pad_direction: right
+  num_workers: 8
+  drop_last: true
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  memmap_dtype: uint32
+  timeout: 0
+  instance_filter:
+    repetition_max_period: 13
+    repetition_min_period: 1
+    repetition_max_count: 32
+  paths:
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00000_00000.npy
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00001_00000.npy
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00002_00000.npy
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00003_00000.npy
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00004_00000.npy
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00005_00000.npy

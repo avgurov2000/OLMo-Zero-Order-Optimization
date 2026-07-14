@@ -1481,3 +1481,248 @@ class KronZO(ZeroOrderOptimizer):
         self._last_metrics["line_search_extends"] = float(n_extends)
 
         return center_loss
+
+
+# ---------------------------------------------------------------------------
+# HiZOO
+# ---------------------------------------------------------------------------
+
+class HiZOO(ZeroOrderOptimizer):
+    """Hessian-Informed Zeroth-Order Optimizer (HiZOO / HiZOO).
+
+    Implements "Second-Order Fine-Tuning without Pain for LLMs: A Hessian Informed
+    Zeroth-Order Optimizer" (Zhao, Dang, Ye, Dai, Qian, Tsang, ICLR 2025),
+    Algorithm 1 (see ``papers/HiZO.pdf``).
+
+    Idea
+    ----
+    MeZO uses an isotropic Gaussian probe ``u`` and takes a step of fixed scale
+    regardless of the local curvature.  Heterogeneous curvature across LLM
+    parameters makes this converge slowly / towards saddle points.  HiZOO
+    additionally estimates a **diagonal Hessian** with one extra forward pass and
+    uses it as a pre-conditioner, so each coordinate is scaled by its curvature —
+    a diagonal-Newton step obtained from forward passes only.
+
+    Per parameter we store the diagonal ``Σ⁻¹`` (an estimate of the diagonal
+    Hessian, initialised to ``1``), EMA-updated each step.  ``Σ^{1/2} = 1/√Σ⁻¹``
+    pre-conditions both the perturbation and the descent direction.
+
+    Each step (Algorithm 1) costs **3 forward passes** and, per parameter,
+    ``u ~ N(0, I)`` reproduced from the shared seed:
+
+      1. ``ℓ   = L(θ)``                                   (center)
+      2. ``ℓ₊  = L(θ + μ Σ^{1/2} u)``
+      3. ``ℓ₋  = L(θ − μ Σ^{1/2} u)``
+      4. scalar curvature ``S = (ℓ₊ + ℓ₋ − 2ℓ) / (2μ²)`` and
+         projected gradient ``g = (ℓ₊ − ℓ₋) / (2μ)``.
+      5. diagonal Hessian estimate ``diag(Σ'ₜ) = S · Σ⁻¹ₜ₋₁ · u²`` and EMA update
+         ``Σ⁻¹ₜ = (1−α) Σ⁻¹ₜ₋₁ + α |diag(Σ'ₜ)|`` (``α`` = smooth scale, Eq. 5).
+      6. descent (Eq. 1/2), using the **updated** ``Σₜ``:
+         ``θᵢ ← θᵢ − ηₜ · g · Σ^{1/2}ₜ,ᵢ · uᵢ``.
+
+    Memory: one extra ``O(d)`` float32 buffer (the diagonal Hessian).  The probe
+    ``u`` is regenerated from the seed rather than stored, matching MeZO's
+    memory-frugal pattern.
+
+    DDP: ``u`` is seeded from the externally broadcast ``z_seed`` and the loss is
+    all-reduced inside the closure, so every rank derives identical scalars, an
+    identical Hessian state and an identical update without gradient
+    communication.  FSDP is not supported (blocked in ``build_optimizer``).
+
+    Notes
+    -----
+    * The paper's Algorithm 1 is inherently three-pass (the Hessian needs the
+      center loss ``ℓ``), so ``perturbation_mode`` is ignored here.
+    * ``num_pert_samples = 1`` (``n = 1``) is the paper's default; larger ``n``
+      averages several probes per step (HiZOO-multi) for a lower-variance Hessian
+      estimate at the cost of ``1 + 2n`` forward passes.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        zo_eps: float = 1e-3,
+        smooth_scale: float = 1e-6,
+        hessian_min: float = 1e-8,
+        weight_decay: float = 0.0,
+        vector_sampling_type: str = "standard_normal",
+        num_pert_samples: int = 1,
+    ):
+        if lr < 0:
+            raise ValueError(f"Invalid lr: {lr}")
+        if zo_eps <= 0:
+            raise ValueError(f"Invalid zo_eps: {zo_eps}")
+        if not (0.0 <= smooth_scale <= 1.0):
+            raise ValueError(f"smooth_scale (EMA α) must be in [0, 1], got {smooth_scale}")
+        if hessian_min <= 0:
+            raise ValueError(f"hessian_min must be > 0, got {hessian_min}")
+        if num_pert_samples < 1:
+            raise ValueError(f"Invalid num_pert_samples: {num_pert_samples}")
+
+        defaults = dict(
+            lr=lr,
+            zo_eps=zo_eps,
+            smooth_scale=smooth_scale,
+            hessian_min=hessian_min,
+            weight_decay=weight_decay,
+            num_pert_samples=num_pert_samples,
+        )
+        super().__init__(params, defaults)
+        self.vector_sampler = VectorSampler(vector_sampling_type)
+        self._generators: dict[torch.device, torch.Generator] = {}
+        self._last_metrics: dict[str, float] = {}
+
+    def _get_generator(self, device: torch.device) -> torch.Generator:
+        if device not in self._generators:
+            self._generators[device] = torch.Generator(device=device)
+        return self._generators[device]
+
+    def _reset_generators(self, z_seed: int) -> None:
+        """Seed each device's generator once before iterating parameters.
+
+        See MeZO._reset_generators for the rationale (seeding once lets the
+        generator advance sequentially so each parameter gets an independent
+        probe, while the same seed reproduces the same probes later).
+        """
+        seen: set[torch.device] = set()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.requires_grad and p.device not in seen:
+                    self._get_generator(p.device).manual_seed(z_seed)
+                    seen.add(p.device)
+
+    def _hess(self, p: torch.Tensor) -> torch.Tensor:
+        """Return the per-parameter diagonal Hessian estimate ``Σ⁻¹`` (float32).
+
+        Lazily initialised to ones (``Σ₀ = I``) on first access.
+        """
+        state = self.state[p]
+        if "hess" not in state:
+            state["hess"] = torch.ones_like(p, dtype=torch.float32)
+        return state["hess"]
+
+    def get_post_step_metrics(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+        """Return HiZOO diagnostics collected during the last step.
+
+        Metrics
+        -------
+        projected_grad_abs
+            Absolute SPSA scalar ``|(ℓ₊ − ℓ₋) / (2μ)|`` (mean over ``n`` probes).
+        curvature_abs
+            Absolute finite-difference curvature ``|(ℓ₊ + ℓ₋ − 2ℓ) / (2μ²)|``
+            (mean over ``n`` probes) — the raw signal driving the Hessian EMA.
+        grad_est_norm
+            Global L2 norm of the applied pre-conditioned update direction
+            ``g · Σ^{1/2} · u`` across all parameters (before ``lr`` scaling).
+        hessian_mean
+            Mean of the diagonal Hessian estimate ``Σ⁻¹`` across all parameters
+            (1.0 at init; drifts towards the local curvature scale).
+        precond_sqrt_mean
+            Mean pre-conditioner ``Σ^{1/2} = 1/√Σ⁻¹`` — the effective per-coordinate
+            step-scale multiplier relative to MeZO.
+        """
+        return {k: torch.tensor(v) for k, v in self._last_metrics.items()}
+
+    @torch.no_grad()
+    def step(self, closure: Callable[[], torch.Tensor], z_seed: Optional[int] = None) -> torch.Tensor:
+        if z_seed is None:
+            z_seed = int(np.random.randint(0, 1_000_000_000))
+
+        mu = self.defaults["zo_eps"]
+        num_pert = self.defaults["num_pert_samples"]
+
+        # Center loss ℓ = L(θ). One evaluation shared by all n probes.
+        center_loss = closure()
+        center = center_loss.item()
+
+        pg_abs_sum = 0.0
+        curv_abs_sum = 0.0
+        for i in range(num_pert):
+            seed_i = (z_seed + i * 987_654_321) % (2**31)
+
+            self._perturb(seed_i, scaling_factor=+1.0)   # θ + μ Σ^{1/2} u
+            loss_plus = closure().item()
+            self._perturb(seed_i, scaling_factor=-2.0)   # θ − μ Σ^{1/2} u
+            loss_minus = closure().item()
+            self._perturb(seed_i, scaling_factor=+1.0)   # restore θ
+
+            projected_grad = (loss_plus - loss_minus) / (2.0 * mu)
+            curvature = (loss_plus + loss_minus - 2.0 * center) / (2.0 * mu * mu)
+            pg_abs_sum += abs(projected_grad)
+            curv_abs_sum += abs(curvature)
+
+            # Update the diagonal Hessian (Σ⁻¹) and apply the pre-conditioned
+            # descent step for this probe, both reproduced from ``seed_i``.
+            self._hessian_and_descent(seed_i, projected_grad, curvature)
+
+        self._last_metrics["projected_grad_abs"] = pg_abs_sum / num_pert
+        self._last_metrics["curvature_abs"] = curv_abs_sum / num_pert
+        return center_loss
+
+    def _perturb(self, z_seed: int, scaling_factor: float) -> None:
+        """θ ← θ + scaling_factor · μ · Σ^{1/2} · u, with ``Σ^{1/2} = 1/√Σ⁻¹``.
+
+        Uses the *current* (pre-update) Hessian, so the ±μ / −2μ sequence cancels
+        exactly and restores θ.
+        """
+        self._reset_generators(z_seed)
+        mu = self.defaults["zo_eps"]
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                gen = self._get_generator(p.device)
+                u = self.vector_sampler.sample(p.shape, p.device, gen).float()
+                precond = torch.rsqrt(self._hess(p))  # Σ^{1/2} = 1/√Σ⁻¹
+                delta = u.mul_(scaling_factor * mu).mul_(precond)
+                p.data.add_(delta.to(p.dtype))
+
+    def _hessian_and_descent(self, z_seed: int, projected_grad: float, curvature: float) -> None:
+        """EMA-update Σ⁻¹ then take the pre-conditioned descent step for one probe.
+
+        Σ'ₜ diagonal:  ``S · Σ⁻¹ₜ₋₁ · u²``  (S = curvature, Eq. 4).
+        EMA (Eq. 5):   ``Σ⁻¹ₜ = (1−α) Σ⁻¹ₜ₋₁ + α |diag(Σ'ₜ)|``.
+        Descent (Eq. 1/2), with the **updated** Σₜ:
+                       ``θᵢ ← θᵢ − lr · g · Σ^{1/2}ₜ,ᵢ · uᵢ``.
+        """
+        self._reset_generators(z_seed)
+        num_pert = self.defaults["num_pert_samples"]
+        alpha = self.defaults["smooth_scale"]
+        hess_min = self.defaults["hessian_min"]
+
+        grad_sum_sq = 0.0
+        hess_sum = 0.0
+        precond_sum = 0.0
+        n_elems = 0
+        for group in self.param_groups:
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                gen = self._get_generator(p.device)
+                u = self.vector_sampler.sample(p.shape, p.device, gen).float()
+                hess = self._hess(p)  # Σ⁻¹ₜ₋₁ (float32, in-place buffer)
+
+                # Diagonal Hessian estimate and EMA (use old Σ⁻¹, then update).
+                sigma_prime = (curvature * hess).mul_(u.mul(u))  # S · Σ⁻¹ · u²
+                hess.mul_(1.0 - alpha).add_(sigma_prime.abs_(), alpha=alpha)
+                hess.clamp_(min=hess_min)
+
+                # Pre-conditioned descent with the updated Σₜ, averaged over n probes.
+                precond = torch.rsqrt(hess)  # Σ^{1/2}ₜ = 1/√Σ⁻¹ₜ
+                grad_est = u.mul_(projected_grad / num_pert).mul_(precond)
+                grad_sum_sq += grad_est.pow(2).sum().item()
+                if weight_decay != 0.0:
+                    grad_est.add_(p.data.float(), alpha=weight_decay)
+                p.data.add_(grad_est.to(p.dtype), alpha=-lr)
+
+                hess_sum += hess.sum().item()
+                precond_sum += precond.sum().item()
+                n_elems += hess.numel()
+
+        self._last_metrics["grad_est_norm"] = math.sqrt(max(grad_sum_sq, 0.0))
+        if n_elems > 0:
+            self._last_metrics["hessian_mean"] = hess_sum / n_elems
+            self._last_metrics["precond_sqrt_mean"] = precond_sum / n_elems

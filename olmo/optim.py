@@ -955,6 +955,7 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
         OptimizerType.zo_adam,
         OptimizerType.zo_muon,
         OptimizerType.kron_zo,
+        OptimizerType.hizoo,
         OptimizerType.ldsd_muon,
         OptimizerType.ldsd_sign_sgd,
         OptimizerType.ldsd_rl,
@@ -1074,6 +1075,20 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             orthogonal_probes=cfg.optimizer.kronzo_orthogonal_probes,
             momentum=cfg.optimizer.kronzo_momentum,
             line_search_steps=cfg.optimizer.kronzo_line_search_steps,
+        )
+    elif cfg.optimizer.name == OptimizerType.hizoo:
+        from .zo_optim import HiZOO
+
+        zg = _zo_param_groups(cfg, model)
+        return HiZOO(
+            zg,
+            lr=cfg.optimizer.learning_rate,
+            zo_eps=cfg.optimizer.zo_eps,
+            smooth_scale=cfg.optimizer.hizoo_smooth_scale,
+            hessian_min=cfg.optimizer.hizoo_hessian_min,
+            weight_decay=cfg.optimizer.weight_decay,
+            vector_sampling_type=cfg.optimizer.mezo_vector_sampling_type,
+            num_pert_samples=cfg.optimizer.mezo_num_pert_samples,
         )
     elif cfg.optimizer.name == OptimizerType.ldsd_muon:
         from .ldsd_optim import LDSDMuon

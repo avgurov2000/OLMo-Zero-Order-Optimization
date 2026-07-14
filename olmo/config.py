@@ -510,6 +510,7 @@ class OptimizerType(StrEnum):
     zo_adam = "zo_adam"
     zo_muon = "zo_muon"
     kron_zo = "kron_zo"
+    hizoo = "hizoo"
     ldsd_muon = "ldsd_muon"
     ldsd_sign_sgd = "ldsd_sign_sgd"
     ldsd_rl = "ldsd_rl"
@@ -611,6 +612,19 @@ class OptimizerConfig(BaseConfig):
     directions and amortizes the expensive 1+3q probe sampling over several real moves
     (adaptive step length). Each extension is one extra forward; keep small (3-5) since the
     direction is chosen on a single minibatch."""
+
+    # --- HiZOO (Hessian-Informed Zeroth-Order Optimizer, ICLR 2025) ---
+
+    hizoo_smooth_scale: float = 1e-6
+    """HiZOO: EMA rate α for the diagonal-Hessian estimate (Eq. 5,
+    ``Σ⁻¹ₜ = (1−α)Σ⁻¹ₜ₋₁ + α|diag(Σ'ₜ)|``). Larger α adapts the pre-conditioner
+    faster but too large impedes convergence or causes gradient explosion (paper
+    Fig. 6); the good regime is ~1e-4…1e-8. μ (finite-diff step) reuses ``zo_eps``."""
+
+    hizoo_hessian_min: float = 1e-8
+    """HiZOO: numerical floor on the diagonal Hessian estimate ``Σ⁻¹`` so the
+    pre-conditioner ``Σ^{1/2} = 1/√Σ⁻¹`` cannot blow up. Not in the paper; a small
+    safety clamp. The Hessian starts at 1 and stays O(1) with small α in practice."""
 
     # --- ZO-vs-FO gradient alignment diagnostic ---
 
