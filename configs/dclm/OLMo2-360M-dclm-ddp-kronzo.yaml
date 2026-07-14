@@ -1,0 +1,186 @@
+# OLMo2 ~360M (d_model=896, 16 слоёв), Wikipedia, оптимизатор KronZO
+# (zero-order, без backward) из статьи GERAD G-2025-44 "Zeroth-order Kronecker
+# optimization for pretraining language models" (Allaire, Le Digabel, Orban, Partovi Nia).
+#
+# Идея KronZO:
+#   * Возмущение Z = A ⊗ B (Кронекер) — почти наверняка ПОЛНОРАНГОВОЕ (в отличие от
+#     низкорангового LOZO), но хранятся только маленькие факторы A, B → сильное сжатие.
+#     B "заморожен" на kronzo_step_interval шагов (аналог V в LOZO), A пересэмплируется.
+#   * Directional update ("lucky RGE"): на каждом шаге сэмплируется q проб, выбирается
+#     ОДНА лучшая по падению лосса, и шаг принимается только если он лучше худшего из
+#     последних h принятых лоссов (скользящее окно). Иначе шаг пропускается (~10% по статье).
+#
+# Стоимость шага: 1 + 3q forward-проходов (two_side). С q=33 это ~100 forward на шаг —
+# заметно дороже MeZO/LOZO, поэтому держите q умеренным. См. метрики в W&B:
+#   throughput/zo_forward_passes_total, optim/accept_rate, optim/grad_est_norm.
+#
+# Модель ~360M: d_model=896, n_layers=16, n_heads=14, mlp_ratio=8 (как в остальных
+# configs/wiki/OLMo2-360M-*). «360M» — номинальный класс; тело без эмбеддингов ~268M.
+#
+# DDP-вариант (несколько карт). FSDP с zero-order не поддерживается — только ddp.
+#
+# Запуск на 2 картах:
+#   uv run torchrun --nproc_per_node=2 scripts/train.py configs/wiki/OLMo2-1B-dclm-ddp-kronzo.yaml
+#
+# Конкретные карты:
+#   CUDA_VISIBLE_DEVICES=0,1 uv run torchrun --nproc_per_node=2 scripts/train.py configs/wiki/OLMo2-1B-dclm-ddp-kronzo.yaml
+#
+# Рецепт статьи: q=33, ν=5, lr=3e-4, ε=2e-4. При нестабильности уменьшайте learning_rate
+# и/или zo_eps; q можно снизить до 10–16 ради скорости.
+
+run_name: OLMo2-360M-dclm-ddp-kronzo
+seed: 6198
+dry_run: false
+
+wandb:
+  name: ${run_name}
+  project: zo-olmo-kronzo
+  group: ${run_name}
+  entity: andrey
+
+model:
+  d_model: 896
+  n_heads: 14
+  n_layers: 16
+  mlp_ratio: 8
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_theta: 500000
+
+  flash_attention: true
+  attention_dropout: 0.0
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1e-6
+  bias_for_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  norm_after: true
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 1024
+  vocab_size: 100278
+  embedding_size: 100352
+  eos_token_id: 100257
+  pad_token_id: 100277
+  # Без FSDP нет param_init_fn с meta → веса инициализируются при создании на GPU.
+  init_device: cuda
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+
+softmax_auxiliary_loss: true
+auxiliary_loss_multiplier: 1e-5
+fused_loss: false
+
+compile: null
+
+optimizer:
+  name: kron_zo
+  learning_rate: 3.0e-4      # как в статье (cosine peak)
+  weight_decay: 0.1
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  metrics_log_interval: 1
+  zo_eps: 2.0e-4             # smoothing ε в диапазоне статьи (1e-4…5e-4)
+  zo_perturbation_mode: two_side
+  # --- KronZO-специфичные параметры (рецепт статьи GERAD G-2025-44) ---
+  kronzo_step_interval: 5        # ν=5 (как в статье)
+  kronzo_query_budget: 33        # q=33 (как в статье); стоимость 1 + 3q ≈ 100 forward/шаг
+  kronzo_history_length: 10      # h=10 (как в статье)
+  kronzo_orthogonal_probes: false # чистый KronZO как в статье (выкл)
+  kronzo_momentum: 0.0            # чистый KronZO как в статье (выкл)
+  kronzo_line_search_steps: 0     # чистый KronZO как в статье (выкл)
+  # Диагностика выравнивания ZO- и FO-градиентов (zo_fo/cosine_selected, zo_fo/cosine_qrge в W&B).
+  # ВНИМАНИЕ: на этих шагах делается реальный backward → память/время как у first-order,
+  # поэтому держим выключенным по умолчанию и редким интервалом. Включайте только для анализа.
+  zo_fo_cosine_enabled: true
+  zo_fo_cosine_interval: 100
+
+scheduler:
+  name: cosine_with_warmup
+  units: tokens
+  t_warmup: 2000000
+  t_max: 500000000
+  alpha_f: 0.1
+  warmup_min_lr: 0.0
+
+tokenizer:
+  identifier: tokenizers/allenai_dolma2.json
+  truncate_direction: right
+
+save_folder: ./runs/OLMo2-360M-dclm-ddp-kronzo
+save_overwrite: false
+
+save_interval: 1000
+save_interval_ephemeral: 1000
+save_num_checkpoints_to_keep: 2
+save_interval_unsharded: 1000
+save_num_unsharded_checkpoints_to_keep: 2
+
+load_path: null
+try_load_latest_save: true       # после краша тот же запуск подхватит последний чекпойнт
+
+global_train_batch_size: 512
+device_train_microbatch_size: 4
+
+max_duration: 500000000T
+
+precision: amp_bf16
+
+distributed_strategy: ddp
+
+ddp:
+  grad_sync_mode: batch
+  find_unused_params: false
+
+max_grad_norm: 1.0
+max_grad_norm_ratio: null
+
+speed_monitor:
+  window_size: 1
+
+gen1_gc_interval: 10
+
+eval_interval: 1000
+eval_subset_num_batches: -1
+device_eval_batch_size: ${device_train_microbatch_size}
+
+evaluators:
+  - label: dolma_wiki-validation
+    type: lm
+    data:
+      pad_direction: right
+      num_workers: 4
+      drop_last: true
+      pin_memory: true
+      prefetch_factor: 2
+      persistent_workers: true
+      memmap_dtype: uint32
+      paths:
+        - /data/users/vtrofimov/OLMo-Zero-Order-Optimization/data/wikitext/validation/0_00000.npy
+
+data:
+  pad_direction: right
+  num_workers: 8
+  drop_last: true
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  memmap_dtype: uint32
+  timeout: 0
+  instance_filter:
+    repetition_max_period: 13
+    repetition_min_period: 1
+    repetition_max_count: 32
+  paths:
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00000_00000.npy
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00001_00000.npy
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00002_00000.npy
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00003_00000.npy
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00004_00000.npy
+    - /data/users/evgeniystep/huawei/OLMo-Zero-Order-Optimization/data/olmo-mix/train/00005_00000.npy
