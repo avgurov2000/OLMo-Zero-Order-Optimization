@@ -1005,7 +1005,91 @@ def _best_pair(n: int) -> tuple[int, int]:
     return (1, n)  # fallback for primes
 
 
-class KronZO(ZeroOrderOptimizer):
+# ---------------------------------------------------------------------------
+# Diagonal-Hessian preconditioner (HiZOO) — shared mix-in
+# ---------------------------------------------------------------------------
+
+class _HessianPreconditioner:
+    """Diagonal-Hessian pre-conditioner (HiZOO, ICLR 2025) as a reusable mix-in.
+
+    Grafts HiZOO's curvature scaling onto any two-sided ZO optimizer that samples a
+    probe direction ``z`` per query. Per parameter we keep a diagonal Hessian estimate
+    ``Σ⁻¹`` (init ``1``) and expose ``Σ^½ = 1/√Σ⁻¹`` as an elementwise pre-conditioner:
+    every perturbation / step is taken along ``Σ^½ ⊙ z`` instead of ``z`` (large steps
+    where the loss is flat, small where it is sharp).
+
+    Once per step the host feeds back the finite-difference curvature along each probe,
+    ``S_i = (ℓ₊ + ℓ₋ − 2ℓ) / (2ε²) ≈ zᵢᵀ H zᵢ`` (HiZOO Eq. 3-4 / Algorithm 1, line 9),
+    and the Hessian is EMA-updated from the raw ``z`` (not the pre-conditioned one):
+
+        Σ' = Σ⁻¹ · (1/q) Σᵢ Sᵢ zᵢ² ,   Σ⁻¹ ← (1−α) Σ⁻¹ + α |Σ'| ,   clamp(min=hess_min).
+
+    In two-sided mode ``ℓ, ℓ₊, ℓ₋`` are already evaluated, so the curvature costs **no
+    extra forward pass**; the only overhead is one ``O(d)`` float32 buffer per parameter
+    (like storing a gradient — still far below first-order, which also holds activations).
+
+    The old ``Σ`` is used for the whole step (probe, candidate and applied update) and the
+    EMA update runs at the very end, so the applied step matches the candidate that was
+    selected; the one-step lag is negligible for the tiny EMA rate ``α``.
+    """
+
+    def _init_hessian(self, enabled: bool, smooth: float, hess_min: float) -> None:
+        if enabled and not (0.0 <= smooth <= 1.0):
+            raise ValueError(f"hessian_smooth (EMA α) must be in [0, 1], got {smooth}")
+        if enabled and hess_min <= 0:
+            raise ValueError(f"hessian_min must be > 0, got {hess_min}")
+        self._hessian_on = bool(enabled)
+        self._hessian_smooth = smooth
+        self._hessian_min = hess_min
+
+    def _hess(self, p: torch.Tensor) -> torch.Tensor:
+        """Per-parameter diagonal Hessian estimate ``Σ⁻¹`` (float32), lazily set to ones."""
+        state = self.state[p]  # type: ignore[attr-defined]
+        if "hess" not in state:
+            state["hess"] = torch.ones_like(p, dtype=torch.float32)
+        return state["hess"]
+
+    def _precond(self, p: torch.Tensor) -> Optional[torch.Tensor]:
+        """``Σ^½ = 1/√Σ⁻¹`` (float32), or ``None`` when the pre-conditioner is off."""
+        if not getattr(self, "_hessian_on", False):
+            return None
+        return torch.rsqrt(self._hess(p))
+
+    def _apply_precond(self, p: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """Return ``Σ^½ ⊙ z`` (in ``p``'s dtype) when enabled, else ``z`` unchanged."""
+        pc = self._precond(p)
+        if pc is None:
+            return z
+        return (z.float() * pc).to(p.dtype)
+
+    @staticmethod
+    def _curvature(l_center: float, l_plus: float, l_minus: float, eps: float) -> float:
+        """Finite-difference curvature ``S = (ℓ₊ + ℓ₋ − 2ℓ) / (2ε²)`` along the probe."""
+        return (l_plus + l_minus - 2.0 * l_center) / (2.0 * eps * eps)
+
+    def _hessian_ema(self, curv_z2: dict[int, torch.Tensor], q: int) -> None:
+        """One EMA update of ``Σ⁻¹`` from the accumulated ``Σᵢ Sᵢ zᵢ²`` (+ diagnostics)."""
+        alpha = self._hessian_smooth
+        hess_min = self._hessian_min
+        hess_sum = precond_sum = 0.0
+        n_elems = 0
+        for group in self.param_groups:  # type: ignore[attr-defined]
+            for p in group["params"]:
+                if not p.requires_grad or id(p) not in curv_z2:
+                    continue
+                hess = self._hess(p)
+                sigma_prime = hess.mul(curv_z2[id(p)]).div_(q)  # Σ⁻¹ · (1/q) Σ Sᵢ zᵢ²
+                hess.mul_(1.0 - alpha).add_(sigma_prime.abs_(), alpha=alpha)
+                hess.clamp_(min=hess_min)
+                hess_sum += hess.sum().item()
+                precond_sum += torch.rsqrt(hess).sum().item()
+                n_elems += hess.numel()
+        if n_elems > 0:
+            self._last_metrics["hessian_mean"] = hess_sum / n_elems  # type: ignore[attr-defined]
+            self._last_metrics["precond_sqrt_mean"] = precond_sum / n_elems  # type: ignore[attr-defined]
+
+
+class KronZO(_HessianPreconditioner, ZeroOrderOptimizer):
     """Zeroth-order Kronecker optimization for LM pretraining (KronZO).
 
     Implements "Zeroth-order Kronecker optimization for pretraining language models"
@@ -1053,6 +1137,9 @@ class KronZO(ZeroOrderOptimizer):
         orthogonal_probes: bool = False,
         momentum: float = 0.0,
         line_search_steps: int = 0,
+        hessian: bool = False,
+        hessian_smooth: float = 1e-6,
+        hessian_min: float = 1e-8,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -1070,6 +1157,13 @@ class KronZO(ZeroOrderOptimizer):
             raise ValueError(f"momentum must be in [0, 1): {momentum}")
         if line_search_steps < 0:
             raise ValueError(f"line_search_steps must be >= 0: {line_search_steps}")
+        if hessian:
+            # HiZOO curvature needs ℓ, ℓ₊, ℓ₋; the momentum/line-search paths don't
+            # thread the pre-conditioner, so keep the combination out for now.
+            if perturbation_mode != "two_side":
+                raise ValueError("hessian preconditioner requires perturbation_mode='two_side'")
+            if momentum != 0.0 or line_search_steps != 0:
+                raise ValueError("hessian preconditioner is not supported with momentum / line_search")
 
         defaults = dict(
             lr=lr,
@@ -1084,6 +1178,7 @@ class KronZO(ZeroOrderOptimizer):
             line_search_steps=line_search_steps,
         )
         super().__init__(params, defaults)
+        self._init_hessian(hessian, hessian_smooth, hessian_min)
         self._step_count = 0
         # Sliding window of the last `history_length` accepted losses; prefilled with
         # +inf so the first `h` steps always pass the acceptance test.
@@ -1259,40 +1354,45 @@ class KronZO(ZeroOrderOptimizer):
         return self._get_z1d(p, seed, idx)
 
     def _perturb_eps(self, seed: int, sign: float) -> None:
-        """θ += sign · ε · Z   (finite-difference probe, single global ε)."""
+        """θ += sign · ε · (Σ^½ ⊙ Z)   (finite-difference probe, single global ε)."""
         eps = self.defaults["zo_eps"]
         for _group, p, idx in self._flat_params():
             if not p.requires_grad:
                 continue
-            p.data.add_(self._build_z(p, idx, seed), alpha=sign * eps)
+            p.data.add_(self._apply_precond(p, self._build_z(p, idx, seed)), alpha=sign * eps)
 
     def _perturb_step(self, seed: int, c: float, sign: float) -> None:
-        """θ += sign · lr · c · Z   (candidate / trial step, per-group lr)."""
+        """θ += sign · lr · c · (Σ^½ ⊙ Z)   (candidate / trial step, per-group lr)."""
         for group, p, idx in self._flat_params():
             if not p.requires_grad:
                 continue
-            p.data.add_(self._build_z(p, idx, seed), alpha=sign * group["lr"] * c)
+            p.data.add_(
+                self._apply_precond(p, self._build_z(p, idx, seed)),
+                alpha=sign * group["lr"] * c,
+            )
 
     def _apply_best(self, seed: int, c: float) -> float:
-        """Apply the accepted update ``θ -= lr · c · Z`` (+ decoupled weight decay).
+        """Apply the accepted update ``θ -= lr · c · (Σ^½ ⊙ Z)`` (+ decoupled weight decay).
 
-        Returns the Frobenius norm of ``c · Z`` summed over params (the update
-        direction magnitude), computed via ``||A⊗B||_F = ||A||_F · ||B||_F``.
+        Returns the Frobenius norm of the applied direction summed over params. Without
+        the pre-conditioner this uses the Kronecker identity ``||A⊗B||_F = ||A||_F·||B||_F``;
+        with it, ``Σ^½ ⊙ Z`` is materialized (as it must be anyway) and normed directly.
         """
         grad_sq = 0.0
+        precond_on = getattr(self, "_hessian_on", False)
         for group, p, idx in self._flat_params():
             if not p.requires_grad:
                 continue
             lr = group["lr"]
             weight_decay = group["weight_decay"]
-            if p.dim() == 2:
+            if p.dim() == 2 and not precond_on:
                 dims = self.state[p]["kron_dims"]
                 a = self._a_for(p, dims, seed, idx)
                 b = self.state[p]["B"]
                 grad_sq += (c * a.float().norm().item() * b.float().norm().item()) ** 2
                 z = torch.kron(a, b)
             else:
-                z = self._get_z1d(p, seed, idx)
+                z = self._apply_precond(p, self._build_z(p, idx, seed))
                 grad_sq += (c * z.float().norm().item()) ** 2
             p.data.add_(z, alpha=-lr * c)
             if weight_decay != 0.0:
@@ -1400,13 +1500,23 @@ class KronZO(ZeroOrderOptimizer):
 
         # Line 5: center loss at θ_k. Also the value reported to the trainer.
         center_loss = closure()
-        l_best = center_loss.item()
+        center = center_loss.item()
+        l_best = center
         best_seed: Optional[int] = None
         best_c: Optional[float] = None
         abs_c_sum = 0.0
         samples: list[tuple[int, float]] = []
         best_probe_idx = -1
         best_probe_loss = float("inf")
+
+        # HiZOO curvature: accumulate Σᵢ Sᵢ zᵢ² (raw z) per param for the Hessian EMA.
+        hess_on = getattr(self, "_hessian_on", False)
+        curv_abs_sum = 0.0
+        curv_z2: dict[int, torch.Tensor] = (
+            {id(p): torch.zeros_like(p, dtype=torch.float32)
+             for _g, p, _i in self._flat_params() if p.requires_grad}
+            if hess_on else {}
+        )
 
         for i in range(q):
             seed_i = self._probe_seeds[i]
@@ -1424,6 +1534,16 @@ class KronZO(ZeroOrderOptimizer):
                 c_i = (loss_plus - l_best) / eps
             abs_c_sum += abs(c_i)
             samples.append((seed_i, c_i))
+
+            # HiZOO: finite-difference curvature Sᵢ ≈ zᵢᵀ H zᵢ (free — two_side only).
+            if hess_on:
+                s_i = self._curvature(center, loss_plus, loss_minus, eps)
+                curv_abs_sum += abs(s_i)
+                for _g, p, idx in self._flat_params():
+                    if not p.requires_grad:
+                        continue
+                    z = self._build_z(p, idx, seed_i).float()
+                    curv_z2[id(p)].add_(z.mul_(z), alpha=s_i)
 
             # Evaluate the candidate step L(θ − lr·c_i·Z_i), then restore.
             self._perturb_step(seed_i, c_i, -1.0)
@@ -1468,6 +1588,12 @@ class KronZO(ZeroOrderOptimizer):
             n_extends = self._line_search(extend, undo, closure, ls_max)
 
         self._push_window(l_best)
+
+        # HiZOO: one EMA update of the diagonal Hessian from this step's q curvatures
+        # (uses the old Σ that pre-conditioned the step; new Σ takes effect next step).
+        if hess_on:
+            self._hessian_ema(curv_z2, q)
+            self._last_metrics["curvature_abs"] = curv_abs_sum / q
 
         self._step_count += 1
         self._n_steps += 1

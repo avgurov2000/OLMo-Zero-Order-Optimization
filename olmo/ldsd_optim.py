@@ -20,7 +20,7 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
-from .zo_optim import VectorSampler, ZeroOrderOptimizer
+from .zo_optim import VectorSampler, ZeroOrderOptimizer, _HessianPreconditioner
 
 
 # ---------------------------------------------------------------------------
@@ -1096,7 +1096,7 @@ class LDSDRlSgd(_MuFromFoGradMixin, ZeroOrderOptimizer):
 # LDSDRlKron
 # ---------------------------------------------------------------------------
 
-class LDSDRlKron(_MuFromFoGradMixin, ZeroOrderOptimizer):
+class LDSDRlKron(_HessianPreconditioner, _MuFromFoGradMixin, ZeroOrderOptimizer):
     """ZO-RL's learned N(μ, σ²) policy wrapped in KronZO's directional selection.
 
     This combines two optimizers:
@@ -1152,6 +1152,9 @@ class LDSDRlKron(_MuFromFoGradMixin, ZeroOrderOptimizer):
         apply: str = "kron",
         mu_return: str = "perturbed",
         mu_init: str = "zero",
+        hessian: bool = False,
+        hessian_smooth: float = 1e-6,
+        hessian_min: float = 1e-8,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -1171,6 +1174,13 @@ class LDSDRlKron(_MuFromFoGradMixin, ZeroOrderOptimizer):
             raise ValueError(f"mu_return must be 'perturbed' or 'candidate', got {mu_return!r}")
         if mu_init not in ("zero", "random"):
             raise ValueError(f"mu_init must be 'zero' or 'random', got {mu_init!r}")
+        if hessian:
+            # Curvature needs ℓ, ℓ₊, ℓ₋ (two_side); the pre-conditioner only makes sense with
+            # the raw kron step — sign_sgd's sign() drops it and adamm already normalizes.
+            if perturbation_mode != "two_side":
+                raise ValueError("hessian preconditioner requires perturbation_mode='two_side'")
+            if apply != "kron":
+                raise ValueError("hessian preconditioner requires apply='kron'")
 
         defaults = dict(
             lr=lr,
@@ -1184,6 +1194,7 @@ class LDSDRlKron(_MuFromFoGradMixin, ZeroOrderOptimizer):
             perturbation_mode=perturbation_mode,
         )
         super().__init__(params, defaults)
+        self._init_hessian(hessian, hessian_smooth, hessian_min)
         self.q = query_budget
         self.variance = variance
         self.lr_mu = lr_mu if lr_mu is not None else lr
@@ -1273,23 +1284,23 @@ class LDSDRlKron(_MuFromFoGradMixin, ZeroOrderOptimizer):
         return torch.normal(mean=mu, std=self.variance, generator=gen)
 
     def _apply_eps(self, seed: int, ids: set[int], sign: float) -> None:
-        """θ += sign · ε · z   (finite-difference probe; single global ε like KronZO)."""
+        """θ += sign · ε · (Σ^½ ⊙ z)   (finite-difference probe; single global ε)."""
         eps = self.defaults["zo_eps"]
         for group in self.param_groups:
             for p in group["params"]:
                 if not p.requires_grad or id(p) not in ids:
                     continue
-                z = self._z(p, seed)
+                z = self._apply_precond(p, self._z(p, seed))
                 p.data.add_(z.to(p.data.dtype), alpha=sign * eps)
 
     def _apply_step(self, seed: int, ids: set[int], c: float, sign: float) -> None:
-        """θ += sign · lr · c · z   (candidate / trial step, per-group lr)."""
+        """θ += sign · lr · c · (Σ^½ ⊙ z)   (candidate / trial step, per-group lr)."""
         for group in self.param_groups:
             lr = group["lr"]
             for p in group["params"]:
                 if not p.requires_grad or id(p) not in ids:
                     continue
-                z = self._z(p, seed)
+                z = self._apply_precond(p, self._z(p, seed))
                 p.data.add_(z.to(p.data.dtype), alpha=sign * lr * c)
 
     def _push_window(self, loss: float) -> None:
@@ -1317,7 +1328,7 @@ class LDSDRlKron(_MuFromFoGradMixin, ZeroOrderOptimizer):
                     continue
                 state = self.state[p]
                 state["step"] += 1
-                z = self._z(p, seed)
+                z = self._apply_precond(p, self._z(p, seed))  # Σ^½ ⊙ z when hessian on
                 grad = z.mul(c)  # ZO-RL gradient estimate: z · (projected_grad/ε) = z · c
                 grad_sq += grad.float().norm().item() ** 2
                 p_dtype = p.data.dtype
@@ -1436,6 +1447,15 @@ class LDSDRlKron(_MuFromFoGradMixin, ZeroOrderOptimizer):
         abs_c_sum = 0.0
         returns: list[float] = []
 
+        # HiZOO curvature: accumulate Σᵢ Sᵢ zᵢ² (raw z) over the active subset.
+        hess_on = getattr(self, "_hessian_on", False)
+        curv_abs_sum = 0.0
+        curv_z2: dict[int, torch.Tensor] = (
+            {id(p): torch.zeros_like(p, dtype=torch.float32)
+             for p in self._all_trainable if id(p) in ids}
+            if hess_on else {}
+        )
+
         for seed_i in candidate_seeds:
             # SPSA scalar c_i along z_i.
             self._apply_eps(seed_i, ids, +1.0)
@@ -1450,6 +1470,17 @@ class LDSDRlKron(_MuFromFoGradMixin, ZeroOrderOptimizer):
                 projected_grad = loss_plus - center
             c_i = projected_grad / eps
             abs_c_sum += abs(c_i)
+
+            # HiZOO: finite-difference curvature Sᵢ ≈ zᵢᵀ H zᵢ (free — two_side only).
+            if hess_on:
+                s_i = self._curvature(center, loss_plus, loss_minus, eps)
+                curv_abs_sum += abs(s_i)
+                for group in self.param_groups:
+                    for p in group["params"]:
+                        if not p.requires_grad or id(p) not in ids:
+                            continue
+                        z = self._z(p, seed_i).float()
+                        curv_z2[id(p)].add_(z.mul_(z), alpha=s_i)
 
             # Evaluate the candidate step L(θ − lr·c_i·z_i), then restore.
             self._apply_step(seed_i, ids, c_i, -1.0)
@@ -1471,6 +1502,12 @@ class LDSDRlKron(_MuFromFoGradMixin, ZeroOrderOptimizer):
             assert best_seed is not None and best_c is not None
             grad_norm = self._apply_update(best_seed, best_c, ids)
         self._push_window(l_best)
+
+        # HiZOO: one EMA update of the diagonal Hessian from this step's curvatures
+        # (old Σ pre-conditioned the step; new Σ takes effect next step).
+        if hess_on:
+            self._hessian_ema(curv_z2, q)
+            self._last_metrics["curvature_abs"] = curv_abs_sum / q
 
         # μ update (ES / score-function) — unchanged; fed by the q probe returns.
         self._mu_update(candidate_seeds, returns, ids)

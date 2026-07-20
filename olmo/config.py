@@ -606,6 +606,20 @@ class OptimizerConfig(BaseConfig):
     sharpen the direction without any backward. Costs one extra buffer per parameter.
     Typical: 0.9 (effective ~10-step averaging)."""
 
+    kronzo_hessian: bool = False
+    """KronZO: enable the HiZOO diagonal-Hessian pre-conditioner. Uses the (free, in two_side
+    mode) curvature ``S = (ℓ₊+ℓ₋−2ℓ)/2ε²`` to maintain a per-parameter ``Σ⁻¹`` and takes every
+    perturbation/step along ``Σ^½ ⊙ z``. Requires ``two_side`` and no momentum / line search.
+    Adds one O(d) float32 buffer per parameter."""
+
+    kronzo_hessian_smooth: float = 1e-6
+    """KronZO: EMA rate α for the diagonal-Hessian update (HiZOO Eq. 5). Only used with
+    ``kronzo_hessian=True``."""
+
+    kronzo_hessian_min: float = 1e-8
+    """KronZO: lower clamp on the diagonal Hessian ``Σ⁻¹`` (keeps ``Σ^½`` finite). Only used
+    with ``kronzo_hessian=True``."""
+
     kronzo_line_search_steps: int = 0
     """KronZO: after an accepted step, keep stepping along the same direction while the
     (same-batch) loss keeps dropping, up to this many extra steps (0 disables). Rides good
@@ -712,6 +726,20 @@ class OptimizerConfig(BaseConfig):
         (sign-aware) signal. Recommended.
       * ``candidate`` — f_i = L(θ − α·c_i·z_i); the same signal KronZO selects on, but it is
         symmetric in z_i ↦ −z_i so it carries no sign information for μ."""
+
+    ldsd_rl_kron_hessian: bool = False
+    """LDSDRlKron: enable the HiZOO diagonal-Hessian pre-conditioner (same mechanism as
+    ``kronzo_hessian``) on top of the ZO-RL sampler. Requires ``two_side`` and
+    ``ldsd_rl_kron_apply='kron'`` (sign_sgd drops the scaling, adamm already normalizes).
+    Adds one O(d) float32 buffer per parameter."""
+
+    ldsd_rl_kron_hessian_smooth: float = 1e-6
+    """LDSDRlKron: EMA rate α for the diagonal-Hessian update. Only used with
+    ``ldsd_rl_kron_hessian=True``."""
+
+    ldsd_rl_kron_hessian_min: float = 1e-8
+    """LDSDRlKron: lower clamp on the diagonal Hessian ``Σ⁻¹``. Only used with
+    ``ldsd_rl_kron_hessian=True``."""
 
     ldsd_rl_mu_init: str = "zero"
     """LDSDRlKron: initial μ_0 when ``ldsd_rl_mu_init_from_fo`` is false.

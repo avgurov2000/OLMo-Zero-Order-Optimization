@@ -1075,6 +1075,9 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             orthogonal_probes=cfg.optimizer.kronzo_orthogonal_probes,
             momentum=cfg.optimizer.kronzo_momentum,
             line_search_steps=cfg.optimizer.kronzo_line_search_steps,
+            hessian=cfg.optimizer.kronzo_hessian,
+            hessian_smooth=cfg.optimizer.kronzo_hessian_smooth,
+            hessian_min=cfg.optimizer.kronzo_hessian_min,
         )
     elif cfg.optimizer.name == OptimizerType.hizoo:
         from .zo_optim import HiZOO
@@ -1191,6 +1194,9 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> torch.optim.Optimizer
             apply=cfg.optimizer.ldsd_rl_kron_apply,
             mu_return=cfg.optimizer.ldsd_rl_kron_mu_return,
             mu_init=cfg.optimizer.ldsd_rl_mu_init,
+            hessian=cfg.optimizer.ldsd_rl_kron_hessian,
+            hessian_smooth=cfg.optimizer.ldsd_rl_kron_hessian_smooth,
+            hessian_min=cfg.optimizer.ldsd_rl_kron_hessian_min,
         )
     else:
         raise NotImplementedError
